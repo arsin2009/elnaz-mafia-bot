@@ -19,7 +19,7 @@ from aiogram.types import (
 # ================================================================
 # CONFIG
 # ================================================================
-TOKEN = "PASTE_YOUR_NEW_TELEGRAM_BOT_TOKEN_HERE"
+TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
