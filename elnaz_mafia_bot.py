@@ -1753,22 +1753,42 @@ async def handle_text(message: Message):
                     await message.answer("❌ لینک نامعتبر است. 🔗 یک لینک t.me یا @username ارسال کن.")
                     return
                 slot = state[0]
-                pending_link[message.from_user.id] = (slot, "chat_id", text)
-                await message.answer(
-                    f"🆔 حالا Chat ID لینک {slot} را ارسال کن.\n\nمثال: -1001234567890\n\n⚠️ ربات باید داخل همان کانال/گروه باشد و برای بررسی عضویت، ترجیحاً ادمین باشد.",
-                )
-                return
-            if isinstance(state, tuple) and state[1] == "chat_id":
-                slot, _, link_value = state
-                try:
-                    chat_id = int(text)
-                except ValueError:
-                    await message.answer("❌ Chat ID باید عدد باشد؛ مثلاً -1001234567890 🆔")
+                link_value = text.strip()
+                target = target_from_link(link_value)
+                if target is not None:
+                    try:
+                        chat = await bot.get_chat(target)
+                        chat_id = chat.id
+                        set_setting("link" + slot, link_value)
+                        set_setting("link" + slot + "_chat_id", str(chat_id))
+                        pending_link.pop(message.from_user.id, None)
+                        title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat_id)
+                        await message.answer(
+                            f"✅ لینک {slot} ذخیره شد. 🔗\n\n📌 چت: {title}\n🆔 Chat ID: <code>{chat_id}</code>\n\n🎯 Chat ID به‌صورت خودکار پیدا و ذخیره شد.\n⚠️ اگر بررسی عضویت خطا داد، مطمئن شو ربات داخل همان چت ادمین است. 🤖🛡️",
+                            parse_mode="HTML",
+                        )
+                    except Exception as exc:
+                        print(f"Auto chat-id lookup failed for {link_value}: {exc}")
+                        await message.answer("❌ نتونستم این چت را از روی لینک پیدا کنم. 🤖 ربات باید داخل همان چت باشد و دسترسی لازم داشته باشد. 🔄 اگر لینک خصوصی است، یک پیام از همان چت را برای ربات فوروارد کن تا Chat ID را خودکار پیدا کنم. 📎")
                     return
+                if re.match(r"https?://t\.me/\+", link_value):
+                    pending_link[message.from_user.id] = (slot, "forward_chat", link_value)
+                    await message.answer(f"🔐 این لینک خصوصی است و تلگرام Chat ID را از خود لینک به ربات نمی‌دهد.\n\n📎 یک پیام از همان کانال/گروه را همینجا فوروارد کن.\n🤖 من Chat ID را خودکار پیدا می‌کنم و لینک {slot} را ذخیره می‌کنم.")
+                    return
+                await message.answer("❌ نتونستم Chat ID این لینک را پیدا کنم. 🔗 لینک را بررسی کن یا یک پیام از همان چت فوروارد کن. 📎")
+                return
+            if isinstance(state, tuple) and state[1] == "forward_chat":
+                slot, _, link_value = state
+                forwarded_chat = message.forward_from_chat
+                if not forwarded_chat:
+                    await message.answer("❌ این پیام از کانال/گروه قابل تشخیص نیست. 📎 یک پیام را مستقیم از همان چت فوروارد کن.")
+                    return
+                chat_id = forwarded_chat.id
                 set_setting("link" + slot, link_value)
                 set_setting("link" + slot + "_chat_id", str(chat_id))
                 pending_link.pop(message.from_user.id, None)
-                await message.answer(f"✅ لینک {slot} و 🆔 Chat ID آن با موفقیت ذخیره شد.\n🔒 بررسی عضویت از این به بعد دقیق‌تر انجام می‌شود.")
+                title = getattr(forwarded_chat, "title", None) or getattr(forwarded_chat, "username", None) or str(chat_id)
+                await message.answer(f"✅ لینک {slot} ذخیره شد. 🔗\n\n📌 چت: {title}\n🆔 Chat ID: <code>{chat_id}</code>\n\n🎯 Chat ID به‌صورت خودکار از پیام فورواردشده پیدا شد. 🤖✅", parse_mode="HTML")
                 return
         return
 
