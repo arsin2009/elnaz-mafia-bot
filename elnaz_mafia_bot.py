@@ -20,11 +20,11 @@ from aiogram.types import (
 # CONFIG
 # ================================================================
 TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is required")
+if not TOKEN or TOKEN == "PASTE_YOUR_NEW_TELEGRAM_BOT_TOKEN_HERE":
+    raise RuntimeError("Please set your Telegram bot token in TOKEN or BOT_TOKEN.")
 
 ARSIN_USERNAME = "arsin_mo"
-DB = "elnaz_mafia.sqlite3"
+DB = os.getenv("DB_PATH", "elnaz_mafia.sqlite3")
 MIN_PLAYERS = 5
 MAX_PLAYERS = 18
 SETUP_REPEAT_SECONDS = 20
@@ -138,6 +138,20 @@ def set_setting(key, value):
             (key, value),
         )
         c.commit()
+
+
+def format_coins(amount):
+    return f"{int(amount):,}"
+
+
+def get_link_chat_id(slot):
+    value = get_setting("link" + slot + "_chat_id")
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
 
 
 # ================================================================
@@ -339,15 +353,18 @@ def target_from_link(value):
 
 async def check_memberships(user_id):
     for key in ("link1", "link2"):
-        target = target_from_link(get_setting(key))
-        if not target:
+        link = get_setting(key)
+        chat_id = get_link_chat_id(key[-1])
+        target = chat_id if chat_id is not None else target_from_link(link)
+        if target is None:
             return False
         try:
             member = await bot.get_chat_member(target, user_id)
             if member.status in ("creator", "administrator", "member") or getattr(member, "is_member", False):
                 continue
             return False
-        except Exception:
+        except Exception as exc:
+            print(f"Membership check failed for {key}: {exc}")
             return False
     return True
 
@@ -1567,7 +1584,7 @@ async def admin_gift(query: CallbackQuery):
 
 
 def gift_keyboard():
-    rows = [[button(f"{code} — {amount} سکه", f"gift:expire:{code}")] for code, amount in active_gifts()]
+    rows = [[button(f"{code} — {format_coins(amount)} 🪙", f"gift:expire:{code}")] for code, amount in active_gifts()]
     return keyboard(rows) if rows else keyboard([[button("کد فعالی وجود ندارد", "gift:none")]])
 
 
@@ -1608,9 +1625,12 @@ async def callback_link(query: CallbackQuery):
         return
 
     slot = query.data.split(":", 1)[1]
-    pending_link[query.from_user.id] = slot
+    pending_link[query.from_user.id] = (slot, "url")
     await query.answer()
-    await bot.send_message(query.from_user.id, "🔗 لینک موردنظر را ارسال کن:")
+    await bot.send_message(
+        query.from_user.id,
+        f"🔗 لینک {slot} را ارسال کن.\n\nمثال: https://t.me/channel یا https://t.me/+InviteLink\n\nبعد از آن 🆔 Chat ID همان کانال/گروه را می‌پرسم تا بررسی عضویت دقیق انجام شود.",
+    )
 
 
 # ================================================================
@@ -1702,9 +1722,9 @@ async def handle_text(message: Message):
             target_id = row[0]
             balance = add_coins(target_id, amount)
             pending_admin.pop(message.from_user.id, None)
-            await message.answer(f"✅ به کاربر {target_username} تعداد {amount} 🪙 سکه اضافه کردی.\n\n💰 موجودی جدید: {balance} سکه")
+            await message.answer(f"✅ به کاربر {target_username} تعداد {format_coins(amount)} 🪙 سکه اضافه کردی.\n\n💰 موجودی جدید: {format_coins(balance)} 🪙")
             try:
-                await bot.send_message(target_id, f"🎁 {amount} 🪙 سکه به موجودی شما اضافه شد.\n💰 موجودی سکه‌ها: {balance}")
+                await bot.send_message(target_id, f"🎁 {format_coins(amount)} 🪙 سکه به موجودی شما اضافه شد.\n💰 موجودی سکه‌ها: {format_coins(balance)} 🪙")
             except Exception:
                 pass
             return
@@ -1726,14 +1746,53 @@ async def handle_text(message: Message):
             pending_admin.pop(message.from_user.id, None)
             await message.answer(f"✅ کد هدیه {code} با هدیه {pending[1]} 🪙 سکه ثبت شد.")
             return
-        if message.from_user.id in pending_link and text.startswith(("http://", "https://", "@")):
-            slot = pending_link.pop(message.from_user.id)
-            set_setting("link" + slot, text)
-            await message.answer(f"✅ لینک {slot} ثبت شد. 🔗")
-            return
+        if message.from_user.id in pending_link:
+            state = pending_link[message.from_user.id]
+            if isinstance(state, tuple) and state[1] == "url":
+                if not text.startswith(("http://", "https://", "@")):
+                    await message.answer("❌ لینک نامعتبر است. 🔗 یک لینک t.me یا @username ارسال کن.")
+                    return
+                slot = state[0]
+                pending_link[message.from_user.id] = (slot, "chat_id", text)
+                await message.answer(
+                    f"🆔 حالا Chat ID لینک {slot} را ارسال کن.\n\nمثال: -1001234567890\n\n⚠️ ربات باید داخل همان کانال/گروه باشد و برای بررسی عضویت، ترجیحاً ادمین باشد.",
+                )
+                return
+            if isinstance(state, tuple) and state[1] == "chat_id":
+                slot, _, link_value = state
+                try:
+                    chat_id = int(text)
+                except ValueError:
+                    await message.answer("❌ Chat ID باید عدد باشد؛ مثلاً -1001234567890 🆔")
+                    return
+                set_setting("link" + slot, link_value)
+                set_setting("link" + slot + "_chat_id", str(chat_id))
+                pending_link.pop(message.from_user.id, None)
+                await message.answer(f"✅ لینک {slot} و 🆔 Chat ID آن با موفقیت ذخیره شد.\n🔒 بررسی عضویت از این به بعد دقیق‌تر انجام می‌شود.")
+                return
         return
 
     if message.chat.type in ("group", "supergroup"):
+        normalized = text.replace("‌", "").strip().lower()
+        if "آرسین" in text or "ارسین" in text:
+            await message.reply("😒 با شوهر من چیکار داری ؟؟ ها؟؟ 😤🫵❤️")
+            return
+        if normalized == "الناز":
+            await message.reply("🥰 جانم بگو 💖✨")
+            return
+        if normalized in ("راهنما الناز", "راهنمای الناز"):
+            await message.reply(
+                "📚 راهنمای الناز 🤖✨\n\n"
+                "🎭 بازی مافیا: با «بازی مافیا» بازی را شروع کن.\n"
+                "🛑 پایان بازی: «پایان بازی» یا «بایان بازی»\n"
+                "🪙 سکه: «عاح» برای دریافت سکه با cooldown پنج‌دقیقه‌ای\n"
+                "💰 موجودی: «موجودی»\n"
+                "🎁 کد هدیه: «کد هدیه CODE»\n"
+                "👤 برای ورود به بازی، اول ربات را در خصوصی /start کن و در هر دو لینک عضویت کن.\n\n"
+                "🔗 اگر دکمه «عضو شدم» را بزنی، عضویتت بررسی می‌شود.\n"
+                "🛠 توسعه‌دهنده: @arsin_mo",
+            )
+            return
         if text == "عاح":
             last = coin_cooldown(message.from_user.id)
             remaining = COIN_COOLDOWN - int(time.time() - last)
@@ -1743,10 +1802,10 @@ async def handle_text(message: Message):
             else:
                 set_coin_time(message.from_user.id, int(time.time()))
                 balance = add_coins(message.from_user.id, COIN_REWARD)
-                await message.reply(f"🪙 از عاح قلیضت خیلی خوشم اومد واسه همین 20 سکه بهت میدم 😍\n💰 موجودی سکه ها : {balance}\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی قشنگم 💖")
+                await message.reply(f"🪙 از عاح قلیضت خیلی خوشم اومد واسه همین {format_coins(COIN_REWARD)} سکه بهت میدم 😍\n💰 موجودی سکه‌ها: {format_coins(balance)} 🪙\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی 💖")
             return
         if text == "موجودی":
-            await message.reply(f"💰 موجودی سکه‌های شما: {get_balance(message.from_user.id)} 🪙"); return
+            await message.reply(f"💰 موجودی سکه‌های شما: {format_coins(get_balance(message.from_user.id))} 🪙"); return
         if text.startswith("کد هدیه "):
             code = text[len("کد هدیه "):].strip()
             amount, status = redeem_gift(code, message.from_user.id)
@@ -1754,7 +1813,7 @@ async def handle_text(message: Message):
                 await message.reply("❌ این کد هدیه وجود ندارد یا منقضی شده است."); return
             if status == "used":
                 await message.reply("⚠️ شما قبلاً از این کد هدیه استفاده کرده‌اید."); return
-            await message.reply(f"🎉 کد هدیه فعال شد!\n🪙 {amount} سکه به موجودی شما اضافه شد.\n💰 موجودی شما: {get_balance(message.from_user.id)} سکه")
+            await message.reply(f"🎉 کد هدیه فعال شد!\n🪙 {format_coins(amount)} سکه به موجودی شما اضافه شد.\n💰 موجودی شما: {format_coins(get_balance(message.from_user.id))} 🪙")
             return
         if text in ("بازی مافیا", "بازی مافیا 🎭"):
             await start_game_setup(message); return
@@ -1775,6 +1834,7 @@ async def handle_text(message: Message):
 # ================================================================
 async def main():
     init_db()
+    print(f"SQLite database: {DB}")
     print("الناز آنلاین شد و منتظر آرسین است...")
     await dp.start_polling(bot)
 
