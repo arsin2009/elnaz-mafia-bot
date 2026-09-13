@@ -15,17 +15,13 @@ from aiogram.types import (
     InlineKeyboardButton,
     ChatPermissions,
 )
-from openai import OpenAI
 
 # ================================================================
 # CONFIG
 # ================================================================
-TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+TOKEN = "PASTE_YOUR_NEW_TELEGRAM_BOT_TOKEN_HERE"
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
-if not OPENAI_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
 ARSIN_USERNAME = "arsin_mo"
 DB = "elnaz_mafia.sqlite3"
@@ -39,7 +35,6 @@ VOTE_SECONDS = 10
 NIGHT_SECONDS = 120
 DEFENSE_SECONDS = 100
 
-client = OpenAI(api_key=OPENAI_KEY)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
@@ -292,19 +287,15 @@ async def eligible_for_game(user_id):
 # ORIGINAL AI HANDLER
 # ================================================================
 async def get_ai_response(user_text, is_arsin):
-    prompt = ELNAZ_SYSTEM_PROMPT
+    # OpenAI disabled: this fallback keeps the bot fully functional without an API key.
+    text = (user_text or "").strip()
+    if "مافیا" in text:
+        return "برای شروع بازی مافیا، داخل گروه «بازی مافیا» رو بفرست."
+    if "سلام" in text:
+        return "سلام! من النازم. فعلاً قابلیت هوش مصنوعی غیرفعاله، ولی بخش بازی مافیا فعاله."
     if is_arsin:
-        prompt += "\n(نکته مهم: تو الان داری با شوهرت آرسین حرف می‌زنی، پس فوق‌العاده عاشقانه باش!)"
-
-    response = await asyncio.to_thread(
-        client.chat.completions.create,
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": user_text},
-        ],
-    )
-    return response.choices[0].message.content
+        return "سلام آرسین! قابلیت هوش مصنوعی فعلاً غیرفعاله؛ برای بازی مافیا می‌تونی از دستور «بازی مافیا» استفاده کنی."
+    return "فعلاً قابلیت گفت‌وگوی هوش مصنوعی غیرفعاله. برای اجرای بازی، «بازی مافیا» رو در گروه بفرست."
 
 
 # ================================================================
