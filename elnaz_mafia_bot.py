@@ -21,14 +21,10 @@ from aiogram.types import (
 # ================================================================
 TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is required")
+    raise RuntimeError("BOT_TOKEN environment variable is required.")
 
 ARSIN_USERNAME = "arsin_mo"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Persistent data directory on the VPS. You can override it with DATA_DIR.
-DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
-os.makedirs(DATA_DIR, exist_ok=True)
-DB = os.path.join(DATA_DIR, "elnaz_mafia.sqlite3")
+DB = os.getenv("DB_PATH", "elnaz_mafia.sqlite3")
 MIN_PLAYERS = 5
 MAX_PLAYERS = 18
 SETUP_REPEAT_SECONDS = 20
@@ -54,51 +50,61 @@ async def send_bot_message(chat_id, text, **kwargs):
     return msg
 
 # ================================================================
-# DATABASE - VPS PERSISTENT SQLITE
+# ORIGINAL ELNAZ PERSONALITY — KEPT INTACT
 # ================================================================
-class Database:
-    """Persistent SQLite database for VPS deployments.
+ELNAZ_SYSTEM_PROMPT = """
+تو «الناز» هستی، همسر آرسین.
+- خیلی وفادار و کمی حسود هستی.
+- اگر کسی اسم «آرسین» را آورد، با لحن تند و حسادت‌آمیز بگو: «من زنشم! چیکار به شوهرم داری؟».
+- اگر آرسین (@arsin_mo) با تو حرف زد یا گفت «عشقم»، تو باید بسیار عاشقانه، دلسوز و مهربان با او حرف بزنی و قربان صدقه‌اش بروی.
+- در بقیه موارد، دوستانه و شیک صحبت می‌کنی.
+"""
 
-    The database is stored on the VPS disk under DATA_DIR by default.
-    SQLite WAL + FULL synchronous mode is enabled so balances, gift codes,
-    links and users survive bot restarts/reboots.
-    """
-    def __init__(self):
-        self.conn = sqlite3.connect(DB, timeout=30, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=FULL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=30000")
+# ================================================================
+# ROLE DEFINITIONS
+# 5 separate buttons exist for شهروند ساده and 5 separate buttons for مافیای ساده.
+# رئیس مافیا + دکتر لکتر CAN BOTH be in the same game.
+# ================================================================
+ROLE_BUTTONS = [
+    ("دکتر", "دکتر", 1),
+    ("کاراگاه", "کاراگاه", 1),
+    ("تک تیر انداز", "تک تیر انداز", 1),
+    ("جان سخت", "جان سخت", 1),
+    ("روان پزشک", "روان پزشک", 1),
+    ("فروشنده", "فروشنده", 1),
+    ("شهروند ساده", "شهروند", 1),
+    ("شهروند ساده", "شهروند", 1),
+    ("شهروند ساده", "شهروند", 1),
+    ("شهروند ساده", "شهروند", 1),
+    ("شهروند ساده", "شهروند", 1),
+    ("رییس مافیا", "رییس مافیا", 1),
+    ("دکتر لکتر", "دکتر لکتر", 1),
+    ("مافیای ساده", "مافیا ساده", 1),
+    ("مافیای ساده", "مافیا ساده", 1),
+    ("مافیای ساده", "مافیا ساده", 1),
+    ("مافیای ساده", "مافیا ساده", 1),
+    ("مافیای ساده", "مافیا ساده", 1),
+]
+MAFIA_ROLES = {"رییس مافیا", "دکتر لکتر", "مافیا ساده"}
 
-    def __enter__(self):
-        return self
+# ================================================================
+# RUNTIME STATE
+# ================================================================
+games = {}
+pending_link = {}
+pending_admin = {}
 
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if exc_type:
-                self.conn.rollback()
-            else:
-                self.conn.commit()
-        finally:
-            self.conn.close()
-        return False
-
-    def execute(self, sql, params=()):
-        return self.conn.execute(sql, params)
-
-    def commit(self):
-        self.conn.commit()
-
-
+# ================================================================
+# DATABASE
+# ================================================================
 def db():
-    return Database()
+    return sqlite3.connect(DB)
 
 
 def init_db():
-    os.makedirs(DATA_DIR, exist_ok=True)
     with db() as c:
         c.execute(
-            "CREATE TABLE IF NOT EXISTS users("
+            "CREATE TABLE IF NOT EXISTS users(" 
             "id INTEGER PRIMARY KEY, username TEXT, started INTEGER DEFAULT 1)"
         )
         c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT)")
@@ -106,17 +112,6 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY, amount INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS gift_redemptions(code TEXT NOT NULL, user_id INTEGER NOT NULL, redeemed_at INTEGER NOT NULL, PRIMARY KEY(code,user_id))")
         c.commit()
-
-
-def database_health_check():
-    """Verify the DB is writable at startup and force a durable checkpoint."""
-    with db() as c:
-        c.execute("CREATE TABLE IF NOT EXISTS _db_health(id INTEGER PRIMARY KEY, checked_at INTEGER NOT NULL)")
-        c.execute("INSERT OR REPLACE INTO _db_health(id, checked_at) VALUES(1, ?)", (int(time.time()),))
-        c.commit()
-        c.execute("PRAGMA wal_checkpoint(PASSIVE)")
-    print(f"[DB] Persistent SQLite: {DB}")
-
 
 
 def remember(user):
@@ -143,6 +138,20 @@ def set_setting(key, value):
             (key, value),
         )
         c.commit()
+
+
+def format_coins(amount):
+    return f"{int(amount):,}"
+
+
+def get_link_chat_id(slot):
+    value = get_setting("link" + slot + "_chat_id")
+    if not value:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
 
 
 # ================================================================
@@ -336,68 +345,72 @@ def target_from_link(value):
     value = value.strip()
     if value.startswith("@"):
         return value
-    match = re.match(r"https?://t\\.me/([A-Za-z0-9_]+)(?:/.*)?$", value)
+    match = re.match(r"https?://t\.me/([A-Za-z0-9_]+)(?:/.*)?$", value)
     if match:
         return "@" + match.group(1)
     return None
 
 
-def get_link_url(slot):
-    return get_setting(f"link{slot}_url") or get_setting(f"link{slot}")
+async def bot_is_admin(chat_id):
+    """Return True only when this bot is an administrator/owner in the target chat."""
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id, me.id)
+        return member.status in ("creator", "administrator")
+    except Exception as exc:
+        print(f"Bot admin check failed for chat {chat_id}: {exc}")
+        return False
 
 
-def get_link_chat_id(slot):
-    value = get_setting(f"link{slot}_chat_id")
-    if value:
-        try:
-            return int(value)
-        except ValueError:
-            return value
-    # Backward compatibility: old public links.
-    old = get_setting(f"link{slot}")
-    return target_from_link(old)
-
-
-def pretty_num(value):
-    return f"{int(value):,}"
+def member_is_joined(member):
+    """Telegram membership states that count as being inside the chat."""
+    status = getattr(member, "status", "")
+    if status in ("creator", "administrator", "member"):
+        return True
+    # In a supergroup/channel a restricted member is still a member when
+    # ChatMemberRestricted.is_member is True.
+    if status == "restricted" and getattr(member, "is_member", False):
+        return True
+    return False
 
 
 async def check_memberships(user_id):
-    diagnostics = []
-    for slot in (1, 2):
-        chat_id = get_link_chat_id(slot)
-        link = get_link_url(slot)
-        if not chat_id:
-            diagnostics.append(f"لینک {slot}: تنظیم نشده ❌")
-            return False, diagnostics
+    """Check both configured chats directly by Chat ID using Telegram Bot API.
+
+    The bot must be an administrator in both chats. This avoids relying on
+    private invite-link parsing, which Telegram does not expose to bots.
+    """
+    for key in ("link1", "link2"):
+        link = get_setting(key)
+        chat_id = get_link_chat_id(key[-1])
+        target = chat_id if chat_id is not None else target_from_link(link)
+        if target is None:
+            print(f"Membership check: {key} has no usable Chat ID")
+            return False
+
         try:
-            member = await bot.get_chat_member(chat_id, user_id)
-            status = str(member.status)
-            is_member = status in ("creator", "administrator", "member") or getattr(member, "is_member", False)
-            if not is_member:
-                diagnostics.append(f"لینک {slot}: عضو نیست ❌")
-                return False, diagnostics
-            diagnostics.append(f"لینک {slot}: عضو است ✅")
-        except Exception as e:
-            diagnostics.append(f"لینک {slot}: خطای دسترسی ربات ⚠️ ({type(e).__name__})")
-            return False, diagnostics
-    return True, diagnostics
+            if not await bot_is_admin(target):
+                print(f"Membership check: bot is NOT admin in {key} ({target})")
+                return False
 
+            member = await bot.get_chat_member(target, user_id)
+            if member_is_joined(member):
+                continue
 
-def membership_url(link):
-    if not link:
-        return None
-    if link.startswith(("http://", "https://")):
-        return link
-    return "https://t.me/" + link.lstrip("@")
+            print(f"Membership check: user {user_id} is not a member of {key}; status={getattr(member, 'status', None)}")
+            return False
+        except Exception as exc:
+            print(f"Membership check failed for {key} / {target}: {exc}")
+            return False
+    return True
 
 
 async def membership_keyboard():
     rows = []
-    for i in (1, 2):
-        link = get_link_url(i)
-        url = membership_url(link)
-        if url:
+    for i, key in enumerate(("link1", "link2"), 1):
+        link = get_setting(key)
+        if link:
+            url = link if link.startswith(("http://", "https://")) else "https://t.me/" + link.lstrip("@")
             rows.append([InlineKeyboardButton(text=f"🔗 لینک عضویت {i}", url=url)])
     rows.append([button("✅ عضو شدم", "check_membership")])
     return keyboard(rows)
@@ -405,19 +418,16 @@ async def membership_keyboard():
 
 async def send_join_buttons(chat_id, include_start=True):
     rows = []
-    for i in (1, 2):
-        url = membership_url(get_link_url(i))
-        if url:
+    for i, key in enumerate(("link1", "link2"), 1):
+        link = get_setting(key)
+        if link:
+            url = link if link.startswith(("http://", "https://")) else "https://t.me/" + link.lstrip("@")
             rows.append([InlineKeyboardButton(text=f"🔗 عضویت در لینک {i}", url=url)])
     if include_start:
         me = await bot.get_me()
         rows.append([InlineKeyboardButton(text="🤖 ورود به ربات / استارت", url=f"https://t.me/{me.username}?start=join_game")])
     rows.append([button("✅ عضو شدم", "check_membership")])
-    await bot.send_message(
-        chat_id,
-        "🔒 ابتدا ربات را استارت کن و در هر دو لینک عضو شو.\n\n👇 بعد از عضویت، «عضو شدم» را بزن تا دوباره بررسی کنم. 🛡️",
-        reply_markup=keyboard(rows),
-    )
+    await bot.send_message(chat_id, "🔒 ابتدا ربات را استارت کن و در هر دو لینک عضو شو.\n\n👇 سپس «عضو شدم» را بزن تا بررسی کنم.", reply_markup=keyboard(rows))
 
 
 async def eligible_for_game(user_id):
@@ -425,8 +435,7 @@ async def eligible_for_game(user_id):
         row = c.execute("SELECT started FROM users WHERE id=?", (user_id,)).fetchone()
     if not row or not row[0]:
         return False
-    ok, _ = await check_memberships(user_id)
-    return ok
+    return await check_memberships(user_id)
 
 
 # ================================================================
@@ -1611,7 +1620,7 @@ async def admin_gift(query: CallbackQuery):
 
 
 def gift_keyboard():
-    rows = [[button(f"{code} — {amount} سکه", f"gift:expire:{code}")] for code, amount in active_gifts()]
+    rows = [[button(f"{code} — {format_coins(amount)} 🪙", f"gift:expire:{code}")] for code, amount in active_gifts()]
     return keyboard(rows) if rows else keyboard([[button("کد فعالی وجود ندارد", "gift:none")]])
 
 
@@ -1652,9 +1661,12 @@ async def callback_link(query: CallbackQuery):
         return
 
     slot = query.data.split(":", 1)[1]
-    pending_link[query.from_user.id] = slot
+    pending_link[query.from_user.id] = (slot, "url")
     await query.answer()
-    await bot.send_message(query.from_user.id, "🔗 لینک موردنظر را ارسال کن:\n\nمثال: https://t.me/channelname یا https://t.me/+xxxxxx")
+    await bot.send_message(
+        query.from_user.id,
+        f"🔗 لینک {slot} را ارسال کن.\n\nمثال: https://t.me/channel یا https://t.me/+InviteLink\n\nبعد از آن 🆔 Chat ID همان کانال/گروه را می‌پرسم تا بررسی عضویت دقیق انجام شود.",
+    )
 
 
 # ================================================================
@@ -1692,10 +1704,8 @@ async def callback_check_membership(query: CallbackQuery):
         await query.answer("❌ ابتدا ربات را استارت کن.", show_alert=True)
         await send_join_buttons(query.message.chat.id, include_start=True)
         return
-    ok, diagnostics = await check_memberships(query.from_user.id)
-    if not ok:
-        await query.answer("❌ هنوز عضویت کامل تأیید نشده.", show_alert=True)
-        await query.message.answer("\n".join(diagnostics) + "\n\n⚠️ اگر عضو هستی ولی تأیید نمی‌شود، مطمئن شو ربات در هر دو چت دسترسی Administrator دارد و دوباره «عضو شدم» را بزن. 🛡️", reply_markup=await membership_keyboard())
+    if not await check_memberships(query.from_user.id):
+        await query.answer("❌ هنوز در همه لینک‌ها عضو نشدی.", show_alert=True)
         return
     await query.answer("✅ عضویت تأیید شد!")
     me = await bot.get_me()
@@ -1748,9 +1758,9 @@ async def handle_text(message: Message):
             target_id = row[0]
             balance = add_coins(target_id, amount)
             pending_admin.pop(message.from_user.id, None)
-            await message.answer(f"✅ به کاربر {target_username} تعداد {amount} 🪙 سکه اضافه کردی.\n\n💰 موجودی جدید: {balance} سکه")
+            await message.answer(f"✅ به کاربر {target_username} تعداد {format_coins(amount)} 🪙 سکه اضافه کردی.\n\n💰 موجودی جدید: {format_coins(balance)} 🪙")
             try:
-                await bot.send_message(target_id, f"🎁 {pretty_num(amount)} 🪙 سکه به موجودی شما اضافه شد.\n💰 موجودی سکه‌ها: {pretty_num(balance)} 🪙")
+                await bot.send_message(target_id, f"🎁 {format_coins(amount)} 🪙 سکه به موجودی شما اضافه شد.\n💰 موجودی سکه‌ها: {format_coins(balance)} 🪙")
             except Exception:
                 pass
             return
@@ -1772,56 +1782,90 @@ async def handle_text(message: Message):
             pending_admin.pop(message.from_user.id, None)
             await message.answer(f"✅ کد هدیه {code} با هدیه {pending[1]} 🪙 سکه ثبت شد.")
             return
-        if message.from_user.id in pending_link and text.startswith(("http://", "https://", "@")):
-            slot = pending_link[message.from_user.id]
-            try:
-                target = target_from_link(text)
-                if not target:
-                    raise ValueError("private_invite")
-                chat = await bot.get_chat(target)
-                set_setting(f"link{slot}_url", text)
-                set_setting(f"link{slot}_chat_id", str(chat.id))
-                # Keep legacy key synchronized for compatibility.
-                set_setting(f"link{slot}", text)
+        if message.from_user.id in pending_link:
+            state = pending_link[message.from_user.id]
+            if isinstance(state, tuple) and state[1] == "url":
+                if not text.startswith(("http://", "https://", "@")):
+                    await message.answer("❌ لینک نامعتبر است. 🔗 یک لینک t.me یا @username ارسال کن.")
+                    return
+                slot = state[0]
+                link_value = text.strip()
+                target = target_from_link(link_value)
+                if target is not None:
+                    try:
+                        chat = await bot.get_chat(target)
+                        chat_id = chat.id
+                        if not await bot_is_admin(chat_id):
+                            await message.answer(
+                                f"❌ ربات هنوز در لینک {slot} ادمین نیست. 🤖🛡️\n\n"
+                                f"ربات را وارد همان کانال/گروه کن و ادمینش کن، بعد دوباره لینک را ثبت کن.\n"
+                                f"🆔 Chat ID: <code>{chat_id}</code>",
+                                parse_mode="HTML",
+                            )
+                            return
+                        set_setting("link" + slot, link_value)
+                        set_setting("link" + slot + "_chat_id", str(chat_id))
+                        pending_link.pop(message.from_user.id, None)
+                        title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat_id)
+                        await message.answer(
+                            f"✅ لینک {slot} با موفقیت ذخیره شد. 🔗🤖\n\n📌 چت: {title}\n🆔 Chat ID: <code>{chat_id}</code>\n🛡️ وضعیت ربات: ادمین\n\n🎯 از این به بعد عضویت کاربران با Chat ID واقعی و Telegram getChatMember بررسی می‌شود. ✅",
+                            parse_mode="HTML",
+                        )
+                    except Exception as exc:
+                        print(f"Auto chat-id lookup failed for {link_value}: {exc}")
+                        await message.answer("❌ نتونستم این چت را از روی لینک پیدا کنم. 🤖 ربات باید داخل همان چت باشد و دسترسی لازم داشته باشد. 🔄 اگر لینک خصوصی است، یک پیام از همان چت را برای ربات فوروارد کن تا Chat ID را خودکار پیدا کنم. 📎")
+                    return
+                if re.match(r"https?://t\.me/\+", link_value):
+                    pending_link[message.from_user.id] = (slot, "forward_chat", link_value)
+                    await message.answer(f"🔐 این لینک خصوصی است و تلگرام Chat ID را از خود لینک به ربات نمی‌دهد.\n\n📎 یک پیام از همان کانال/گروه را همینجا فوروارد کن.\n🤖 من Chat ID را خودکار پیدا می‌کنم و لینک {slot} را ذخیره می‌کنم.")
+                    return
+                await message.answer("❌ نتونستم Chat ID این لینک را پیدا کنم. 🔗 لینک را بررسی کن یا یک پیام از همان چت فوروارد کن. 📎")
+                return
+            if isinstance(state, tuple) and state[1] == "forward_chat":
+                slot, _, link_value = state
+                forwarded_chat = message.forward_from_chat
+                if not forwarded_chat:
+                    await message.answer("❌ این پیام از کانال/گروه قابل تشخیص نیست. 📎 یک پیام را مستقیم از همان چت فوروارد کن.")
+                    return
+                chat_id = forwarded_chat.id
+                if not await bot_is_admin(chat_id):
+                    await message.answer(
+                        f"❌ ربات در این چت ادمین نیست. 🤖🛡️\n\n"
+                        f"اول ربات را داخل همان کانال/گروه ادمین کن و سپس پیام را دوباره فوروارد کن.\n"
+                        f"🆔 Chat ID: <code>{chat_id}</code>",
+                        parse_mode="HTML",
+                    )
+                    return
+                set_setting("link" + slot, link_value)
+                set_setting("link" + slot + "_chat_id", str(chat_id))
                 pending_link.pop(message.from_user.id, None)
-                await message.answer(f"✅ لینک {slot} ذخیره شد. 🔗\n🆔 Chat ID: `{chat.id}`\n📌 نام: {getattr(chat, 'title', None) or getattr(chat, 'username', None) or 'چت'}", parse_mode="Markdown")
-            except Exception as e:
-                await message.answer("⚠️ ربات نتوانست Chat ID را از این لینک پیدا کند.\n\nاگر لینک خصوصی مثل `t.me/+...` است، یک پیام از همان کانال/گروه را برای ربات فوروارد کن تا Chat ID را خودکار استخراج کنم. 📎🆔\n\nاگر لینک عمومی است، ربات را در آن چت اضافه/ادمین کن و دوباره لینک را بفرست. 🛡️", parse_mode="Markdown")
-            return
-
-        forwarded_chat = getattr(message, "forward_from_chat", None)
-        if not forwarded_chat:
-            origin = getattr(message, "forward_origin", None)
-            forwarded_chat = getattr(origin, "chat", None)
-        if message.from_user.id in pending_link and forwarded_chat:
-            slot = pending_link.pop(message.from_user.id)
-            chat = forwarded_chat
-            set_setting(f"link{slot}_chat_id", str(chat.id))
-            old_link = get_setting(f"link{slot}_url") or get_setting(f"link{slot}") or ""
-            set_setting(f"link{slot}_url", old_link)
-            set_setting(f"link{slot}", old_link)
-            await message.answer(f"✅ Chat ID لینک {slot} خودکار پیدا و ذخیره شد. 🆔\n`{chat.id}`\n\n🔗 حالا بررسی عضویت با همین Chat ID انجام می‌شود. 🛡️", parse_mode="Markdown")
-            return
+                title = getattr(forwarded_chat, "title", None) or getattr(forwarded_chat, "username", None) or str(chat_id)
+                await message.answer(
+                    f"✅ لینک {slot} ذخیره شد. 🔗🤖\n\n📌 چت: {title}\n🆔 Chat ID: <code>{chat_id}</code>\n🛡️ وضعیت ربات: ادمین\n\n🎯 بررسی عضویت از این به بعد مستقیم با Chat ID واقعی انجام می‌شود. ✅",
+                    parse_mode="HTML",
+                )
+                return
         return
 
     if message.chat.type in ("group", "supergroup"):
-        normalized = text.replace("آ", "ا")
-        if "ارسین" in normalized or "ارسين" in text:
-            await message.answer("😤 با شوهر من چیکار داری ؟؟ ها؟؟ 🫵😠💢")
+        normalized = text.replace("‌", "").strip().lower()
+        if "آرسین" in text or "ارسین" in text:
+            await message.reply("😒 با شوهر من چیکار داری ؟؟ ها؟؟ 😤🫵❤️")
             return
-        if "الناز" in text:
-            await message.answer("🥰 جانم بگو 💕👀")
+        if normalized == "الناز":
+            await message.reply("🥰 جانم بگو 💖✨")
             return
-        if text in ("راهنما", "راهنما الناز", "راهنمای الناز"):
-            await message.answer(
-                "📚 راهنمای الناز 🤖\n\n"
-                "🎭 بازی مافیا: «بازی مافیا»\n"
-                "🛑 پایان بازی: «پایان بازی»\n"
-                "🪙 گرفتن سکه: «عاح» (هر ۵ دقیقه)\n"
-                "💰 موجودی سکه: «موجودی»\n"
+        if normalized in ("راهنما الناز", "راهنمای الناز"):
+            await message.reply(
+                "📚 راهنمای الناز 🤖✨\n\n"
+                "🎭 بازی مافیا: با «بازی مافیا» بازی را شروع کن.\n"
+                "🛑 پایان بازی: «پایان بازی» یا «بایان بازی»\n"
+                "🪙 سکه: «عاح» برای دریافت سکه با cooldown پنج‌دقیقه‌ای\n"
+                "💰 موجودی: «موجودی»\n"
                 "🎁 کد هدیه: «کد هدیه CODE»\n"
-                "👥 برای ورود به بازی باید ربات را استارت کرده باشی و عضو هر دو لینک باشی.\n\n"
-                "🛠️ توسعه‌دهنده: @arsin_mo"
+                "👤 برای ورود به بازی، اول ربات را در خصوصی /start کن و در هر دو لینک عضویت کن.\n\n"
+                "🔗 اگر دکمه «عضو شدم» را بزنی، عضویتت بررسی می‌شود.\n"
+                "🛠 توسعه‌دهنده: @arsin_mo",
             )
             return
         if text == "عاح":
@@ -1833,10 +1877,10 @@ async def handle_text(message: Message):
             else:
                 set_coin_time(message.from_user.id, int(time.time()))
                 balance = add_coins(message.from_user.id, COIN_REWARD)
-                await message.reply(f"🪙 از عاح قلیضت خیلی خوشم اومد واسه همین {pretty_num(COIN_REWARD)} سکه بهت میدم 😍\n💰 موجودی سکه‌ها: {pretty_num(balance)} 🪙\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی قشنگم 💖")
+                await message.reply(f"🪙 از عاح قلیضت خیلی خوشم اومد واسه همین {format_coins(COIN_REWARD)} سکه بهت میدم 😍\n💰 موجودی سکه‌ها: {format_coins(balance)} 🪙\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی 💖")
             return
         if text == "موجودی":
-            await message.reply(f"💰 موجودی سکه‌های شما: {pretty_num(get_balance(message.from_user.id))} 🪙"); return
+            await message.reply(f"💰 موجودی سکه‌های شما: {format_coins(get_balance(message.from_user.id))} 🪙"); return
         if text.startswith("کد هدیه "):
             code = text[len("کد هدیه "):].strip()
             amount, status = redeem_gift(code, message.from_user.id)
@@ -1844,7 +1888,7 @@ async def handle_text(message: Message):
                 await message.reply("❌ این کد هدیه وجود ندارد یا منقضی شده است."); return
             if status == "used":
                 await message.reply("⚠️ شما قبلاً از این کد هدیه استفاده کرده‌اید."); return
-            await message.reply(f"🎉 کد هدیه فعال شد!\n🪙 {pretty_num(amount)} سکه به موجودی شما اضافه شد.\n💰 موجودی شما: {pretty_num(get_balance(message.from_user.id))} 🪙")
+            await message.reply(f"🎉 کد هدیه فعال شد!\n🪙 {format_coins(amount)} سکه به موجودی شما اضافه شد.\n💰 موجودی شما: {format_coins(get_balance(message.from_user.id))} 🪙")
             return
         if text in ("بازی مافیا", "بازی مافیا 🎭"):
             await start_game_setup(message); return
@@ -1865,7 +1909,7 @@ async def handle_text(message: Message):
 # ================================================================
 async def main():
     init_db()
-    database_health_check()
+    print(f"SQLite database: {DB}")
     print("الناز آنلاین شد و منتظر آرسین است...")
     await dp.start_polling(bot)
 
