@@ -20,8 +20,7 @@ from openai import OpenAI
 # ================================================================
 # CONFIG
 # ================================================================
-TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c
-"
+TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
