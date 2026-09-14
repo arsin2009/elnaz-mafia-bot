@@ -2251,11 +2251,11 @@ async def wager_dooz_callback(query: CallbackQuery):
     result=dooz_winner(board)
     if result:
         if result=="draw":
-            await finish_wager(wid,draw=True)
+            finish_wager(wid,draw=True)
             text="🤝 دوز مساوی شد!\n💎 ورودی هر دو نفر برگشت داده شد."
         else:
             winner=w["creator_id"] if result=="⭕" else w["opponent_id"]
-            await finish_wager(wid,winner)
+            finish_wager(wid,winner)
             text=f"🏆 برنده دوز: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
         await query.message.edit_text(text)
     else:
@@ -2306,13 +2306,13 @@ async def wager_evenodd_callback(query: CallbackQuery):
     await query.answer("✅ انتخاب ثبت شد.")
     if len(w["choices"])<2: return
     if w["choices"][w["creator_id"]]==w["choices"][w["opponent_id"]]:
-        await finish_wager(wid,draw=True)
+        finish_wager(wid,draw=True)
         await query.message.edit_text("🤝 هر دو یک گزینه را انتخاب کردند؛ ورودی‌ها برگشت.")
         return
     number=random.randint(1,100)
     winner_choice="even" if number%2==0 else "odd"
     winner=w["creator_id"] if w["choices"][w["creator_id"]]==winner_choice else w["opponent_id"]
-    await finish_wager(wid,winner)
+    finish_wager(wid,winner)
     await query.message.edit_text(f"🎯 عدد قرعه: {number} — {'زوج 🔵' if winner_choice=='even' else 'فرد 🟣'}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")
 
 @dp.callback_query(F.data.startswith("wager:guess:"))
@@ -2329,11 +2329,11 @@ async def wager_guess_callback(query: CallbackQuery):
     target=random.randint(1,10)
     if guess==target:
         winner=w["opponent_id"]
-        await finish_wager(wid,winner)
+        finish_wager(wid,winner)
         text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
     else:
         winner=w["creator_id"]
-        await finish_wager(wid,winner)
+        finish_wager(wid,winner)
         text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
     await query.message.edit_text(text)
     await query.answer()
