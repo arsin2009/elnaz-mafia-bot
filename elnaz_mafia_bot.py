@@ -98,6 +98,9 @@ pending_link = {}
 pending_admin = {}
 transfer_pending = {}
 market_pending = {}
+wager_games = {}
+wager_counter = 0
+WAGER_WAIT_SECONDS = 60
 
 # ================================================================
 # DATABASE
@@ -129,6 +132,7 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS titles(user_id INTEGER NOT NULL, title TEXT NOT NULL, PRIMARY KEY(user_id,title))")
         c.execute("CREATE TABLE IF NOT EXISTS user_title(user_id INTEGER PRIMARY KEY, title TEXT DEFAULT '')")
         c.execute("CREATE TABLE IF NOT EXISTS market(listing_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, amount INTEGER NOT NULL, price INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS wager_games(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL DEFAULT 0, game_type TEXT NOT NULL, creator_id INTEGER NOT NULL, stake INTEGER NOT NULL, opponent_id INTEGER DEFAULT 0, status TEXT NOT NULL, created_at INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, balance_after INTEGER NOT NULL, note TEXT DEFAULT '', created_at INTEGER DEFAULT 0)")
         c.commit()
 
@@ -423,6 +427,194 @@ def buy_market_listing(buyer_id,listing_id):
     log_tx(buyer_id,"market_buy",amount,f"paid={price}")
     log_tx(seller,"market_sell",price,f"sold={amount}")
     return True,"ok",price,amount
+
+
+# ================================================================
+# PLAYER-vs-PLAYER WAGER GAMES
+# ================================================================
+WAGER_GAME_NAMES = {
+    "dooz": "دوز",
+    "rps": "سنگ کاغذ قیچی",
+    "cards": "جنگ کارت",
+    "evenodd": "زوج یا فرد",
+    "guess": "حدس عدد",
+    "higher": "بالاتر",
+}
+
+def create_wager(chat_id, creator_id, game_type, stake):
+    global wager_counter
+    if stake <= 0 or get_balance(creator_id) < stake:
+        return None, "funds"
+    add_coins(creator_id, -stake)
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO wager_games(chat_id,message_id,game_type,creator_id,stake,status,created_at,expires_at) VALUES(?,?,?,?,?,'waiting',?,?)",
+            (chat_id, 0, game_type, creator_id, stake, int(time.time()), int(time.time()) + WAGER_WAIT_SECONDS)
+        )
+        wid = cur.lastrowid
+        c.commit()
+    wager_counter += 1
+    wager_games[wid] = {
+        "id": wid, "chat_id": chat_id, "message_id": 0, "game_type": game_type,
+        "creator_id": creator_id, "stake": stake, "opponent_id": None,
+        "status": "waiting", "created_at": time.time(), "expires_at": time.time() + WAGER_WAIT_SECONDS
+    }
+    log_tx(creator_id, "wager_lock", -stake, WAGER_GAME_NAMES.get(game_type, game_type))
+    return wid, "ok"
+
+def set_wager_message(wid, message_id):
+    if wid in wager_games:
+        wager_games[wid]["message_id"] = message_id
+    with db() as c:
+        c.execute("UPDATE wager_games SET message_id=? WHERE id=? AND status='waiting'", (message_id, wid))
+        c.commit()
+
+def get_wager(wid):
+    if wid in wager_games:
+        return wager_games[wid]
+    with db() as c:
+        row = c.execute(
+            "SELECT id,chat_id,message_id,game_type,creator_id,stake,opponent_id,status,created_at,expires_at FROM wager_games WHERE id=?",
+            (wid,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "chat_id": row[1], "message_id": row[2], "game_type": row[3],
+        "creator_id": row[4], "stake": row[5], "opponent_id": row[6] or None,
+        "status": row[7], "created_at": row[8], "expires_at": row[9]
+    }
+
+def refund_wager(wid):
+    w = get_wager(wid)
+    if not w or w["status"] != "waiting":
+        return False, w
+    add_coins(w["creator_id"], w["stake"])
+    log_tx(w["creator_id"], "wager_refund", w["stake"], WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+    with db() as c:
+        c.execute("UPDATE wager_games SET status='refunded' WHERE id=? AND status='waiting'", (wid,))
+        c.commit()
+    wager_games.pop(wid, None)
+    return True, w
+
+def join_wager(wid, opponent_id):
+    w = get_wager(wid)
+    if not w:
+        return None, "missing"
+    if w["status"] != "waiting":
+        return w, "closed"
+    if int(time.time()) >= int(w["expires_at"]):
+        return w, "expired"
+    if opponent_id == w["creator_id"]:
+        return w, "self"
+    if get_balance(opponent_id) < w["stake"]:
+        return w, "funds"
+    add_coins(opponent_id, -w["stake"])
+    with db() as c:
+        c.execute(
+            "UPDATE wager_games SET opponent_id=?,status='active' WHERE id=? AND status='waiting'",
+            (opponent_id, wid)
+        )
+        c.commit()
+    w["opponent_id"] = opponent_id
+    w["status"] = "active"
+    wager_games[wid] = w
+    log_tx(opponent_id, "wager_lock", -w["stake"], WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+    return w, "ok"
+
+def finish_wager(wid, winner_id=None, draw=False):
+    w = get_wager(wid)
+    if not w or w["status"] != "active":
+        return None, "closed"
+    pot = w["stake"] * 2
+    if draw:
+        add_coins(w["creator_id"], w["stake"])
+        add_coins(w["opponent_id"], w["stake"])
+        log_tx(w["creator_id"], "wager_draw_refund", w["stake"], WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+        log_tx(w["opponent_id"], "wager_draw_refund", w["stake"], WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+    else:
+        add_coins(winner_id, pot)
+        log_tx(winner_id, "wager_win", pot, WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+    with db() as c:
+        c.execute("UPDATE wager_games SET status=? WHERE id=?", ("draw" if draw else "finished", wid))
+        c.commit()
+    wager_games.pop(wid, None)
+    return w, "ok"
+
+def wager_invite_keyboard(wid):
+    return keyboard([[button("🎮 شرکت کردن", f"wager:join:{wid}")]])
+
+def wager_game_players(w):
+    return (w["creator_id"], w["opponent_id"])
+
+def wager_display_name(user):
+    return f"@{user.username}" if user and user.username else (user.full_name if user else "بازیکن")
+
+async def wager_expiry_task(wid):
+    await asyncio.sleep(WAGER_WAIT_SECONDS)
+    w = get_wager(wid)
+    if not w or w["status"] != "waiting":
+        return
+    ok, w = refund_wager(wid)
+    if not ok:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=w["chat_id"],
+            message_id=w["message_id"],
+            text=f"⏰ زمان «{WAGER_GAME_NAMES.get(w['game_type'], w['game_type'])}» تمام شد.\n\n"
+                 f"👤 کسی شرکت نکرد.\n💎 مبلغ {format_coins(w['stake'])} آریور به حساب سازنده برگشت خورد. ↩️"
+        )
+    except Exception:
+        pass
+
+async def start_wager_game(w):
+    gid=w["id"]; chat_id=w["chat_id"]; creator=w["creator_id"]; opponent=w["opponent_id"]; stake=w["stake"]
+    name=WAGER_GAME_NAMES.get(w["game_type"],w["game_type"])
+    if w["game_type"]=="dooz":
+        wager_games[gid]["board"]=[""]*9
+        wager_games[gid]["turn"]=creator
+        await send_bot_message(chat_id, f"⭕️❌ دوز شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nنوبت {display_name_by_id(creator)} است.",
+                                reply_markup=dooz_keyboard(gid))
+
+    if w["game_type"]=="rps":
+        wager_games[gid]["choices"]={}
+        await send_bot_message(chat_id, f"✊✋✌️ {name} شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n👥 بازیکنان: @{'' if not creator else ''}\n\nهر دو بازیکن انتخاب خود را بزنند.",
+                                reply_markup=keyboard([
+                                    [button("✊ سنگ",f"wager:rps:{gid}:rock"),button("📄 کاغذ",f"wager:rps:{gid}:paper"),button("✂️ قیچی",f"wager:rps:{gid}:scissors")]
+                                ]))
+    elif w["game_type"]=="cards":
+        a=random.randint(1,13); b=random.randint(1,13)
+        winner=creator if a>b else opponent if b>a else None
+        await finish_wager(gid,winner,draw=winner is None)
+        await send_bot_message(chat_id, f"🃏 جنگ کارت تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n"+(f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی شد؛ ورودی هر دو نفر برگشت."))
+    elif w["game_type"]=="evenodd":
+        wager_games[gid]["choices"]={}
+        await send_bot_message(chat_id, f"🎯 زوج یا فرد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nهر بازیکن انتخاب خودش را بزند.",
+                                reply_markup=keyboard([[button("🔵 زوج",f"wager:evenodd:{gid}:even"),button("🟣 فرد",f"wager:evenodd:{gid}:odd")]]))
+    elif w["game_type"]=="guess":
+        wager_games[gid]["guess"]={}
+        await send_bot_message(chat_id, f"🔢 حدس عدد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nبازیکن دوم باید عدد ۱ تا ۱۰ را حدس بزند.",
+                                reply_markup=keyboard([[button(str(i),f"wager:guess:{gid}:{i}") for i in range(1,6)],
+                                                       [button(str(i),f"wager:guess:{gid}:{i}") for i in range(6,11)]]))
+    elif w["game_type"]=="higher":
+        a=random.randint(1,100); b=random.randint(1,100)
+        winner=creator if a>b else opponent if b>a else None
+        await finish_wager(gid,winner,draw=winner is None)
+        await send_bot_message(chat_id, f"📈 بازی بالاتر تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n"+(f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی شد؛ ورودی هر دو نفر برگشت."))
+
+def display_name_by_id(user_id):
+    try:
+        row=get_user_record(user_id)
+        if row:
+            return "@"+row[1] if row[1] else f"کاربر {user_id}"
+    except Exception:
+        pass
+    return f"کاربر {user_id}"
+
+def get_user_record(user_id):
+    with db() as c:
+        return c.execute("SELECT id,username FROM users WHERE id=?", (user_id,)).fetchone()
 
 def active_gifts():
     with db() as c:
@@ -1919,6 +2111,26 @@ async def finish_game(chat_id):
     )
 
 
+
+def dooz_keyboard(gid):
+    board=wager_games.get(gid,{}).get("board",[""]*9)
+    rows=[]
+    for r in range(3):
+        row=[]
+        for c in range(3):
+            idx=r*3+c
+            row.append(button(board[idx] or "⬜", f"wager:dooz:{gid}:{idx}"))
+        rows.append(row)
+    return keyboard(rows)
+
+def dooz_winner(board):
+    wins=((0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6))
+    for a,b,c in wins:
+        if board[a] and board[a]==board[b]==board[c]:
+            return board[a]
+    if all(board): return "draw"
+    return None
+
 # ================================================================
 # USER MENU / ECONOMY
 # ================================================================
@@ -1987,6 +2199,145 @@ def user_help_text():
             "• «/start» → ثبت‌نام و بررسی عضویت 🔗\n\n"
             "🛠️ توسعه‌دهنده: @arsin_mo")
 
+
+@dp.callback_query(F.data.startswith("wager:join:"))
+async def wager_join_callback(query: CallbackQuery):
+    try: wid=int(query.data.rsplit(":",1)[1])
+    except Exception:
+        await query.answer("❌ بازی نامعتبر است.",show_alert=True); return
+    w, status=join_wager(wid,query.from_user.id)
+    if status=="missing":
+        await query.answer("❌ این بازی پیدا نشد.",show_alert=True); return
+    if status=="closed":
+        await query.answer("❌ این بازی قبلاً شروع یا تمام شده.",show_alert=True); return
+    if status=="expired":
+        await refund_wager(wid)
+        await query.answer("⏰ زمان شرکت تمام شده.",show_alert=True); return
+    if status=="self":
+        await query.answer("😄 خودت سازنده بازی هستی؛ نفر دوم باید شرکت کند.",show_alert=True); return
+    if status=="funds":
+        await query.answer("❌ موجودی آریورت برای ورود کافی نیست.",show_alert=True); return
+    try:
+        await query.message.edit_text(
+            f"🎮 {WAGER_GAME_NAMES[w['game_type']]} شروع شد!\n\n"
+            f"👤 بازیکن اول: {display_name_by_id(w['creator_id'])}\n"
+            f"👤 بازیکن دوم: {display_name_by_id(w['opponent_id'])}\n"
+            f"💎 ورودی هر نفر: {format_coins(w['stake'])} آریور\n"
+            f"🏆 جایزه برنده: {format_coins(w['stake']*2)} آریور"
+        )
+    except Exception:
+        pass
+    await query.answer("🎮 وارد بازی شدی!")
+    await start_wager_game(w)
+
+@dp.callback_query(F.data.startswith("wager:dooz:"))
+async def wager_dooz_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); idx=int(parts[3])
+    except Exception:
+        await query.answer("❌ حرکت نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active":
+        await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if query.from_user.id not in (w["creator_id"],w["opponent_id"]):
+        await query.answer("❌ شما بازیکن این بازی نیستی.",show_alert=True); return
+    if query.from_user.id != w.get("turn"):
+        await query.answer("⏳ الان نوبت شما نیست.",show_alert=True); return
+    board=w["board"]
+    if not 0<=idx<9 or board[idx]:
+        await query.answer("❌ این خانه پر است.",show_alert=True); return
+    mark="⭕" if query.from_user.id==w["creator_id"] else "❌"
+    board[idx]=mark
+    result=dooz_winner(board)
+    if result:
+        if result=="draw":
+            await finish_wager(wid,draw=True)
+            text="🤝 دوز مساوی شد!\n💎 ورودی هر دو نفر برگشت داده شد."
+        else:
+            winner=w["creator_id"] if result=="⭕" else w["opponent_id"]
+            await finish_wager(wid,winner)
+            text=f"🏆 برنده دوز: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
+        await query.message.edit_text(text)
+    else:
+        w["turn"]=w["opponent_id"] if query.from_user.id==w["creator_id"] else w["creator_id"]
+        await query.message.edit_text(
+            f"⭕️❌ دوز — نوبت {display_name_by_id(w['turn'])}\n💎 جایزه فعلی: {format_coins(w['stake']*2)} آریور",
+            reply_markup=dooz_keyboard(wid)
+        )
+    await query.answer()
+
+@dp.callback_query(F.data.startswith("wager:rps:"))
+async def wager_rps_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); choice=parts[3]
+    except Exception:
+        await query.answer("❌ انتخاب نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active":
+        await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if query.from_user.id not in (w["creator_id"],w["opponent_id"]):
+        await query.answer("❌ شما بازیکن این بازی نیستی.",show_alert=True); return
+    w.setdefault("choices",{})[query.from_user.id]=choice
+    await query.answer("✅ انتخاب ثبت شد.")
+    if len(w["choices"])<2: return
+    a=w["choices"][w["creator_id"]]; b=w["choices"][w["opponent_id"]]
+    winmap={"rock":"scissors","scissors":"paper","paper":"rock"}
+    if a==b: winner=None
+    elif winmap[a]==b: winner=w["creator_id"]
+    else: winner=w["opponent_id"]
+    await finish_wager(wid,winner,draw=winner is None)
+    names={"rock":"✊ سنگ","paper":"📄 کاغذ","scissors":"✂️ قیچی"}
+    text=f"✊✋✌️ نتیجه بازی\n\n👤 اول: {names[a]}\n👤 دوم: {names[b]}\n\n"
+    text += "🤝 مساوی شد؛ ورودی‌ها برگشت." if winner is None else f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
+    await query.message.edit_text(text)
+
+@dp.callback_query(F.data.startswith("wager:evenodd:"))
+async def wager_evenodd_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); choice=parts[3]
+    except Exception:
+        await query.answer("❌ انتخاب نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active":
+        await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if query.from_user.id not in (w["creator_id"],w["opponent_id"]):
+        await query.answer("❌ شما بازیکن این بازی نیستی.",show_alert=True); return
+    w.setdefault("choices",{})[query.from_user.id]=choice
+    await query.answer("✅ انتخاب ثبت شد.")
+    if len(w["choices"])<2: return
+    if w["choices"][w["creator_id"]]==w["choices"][w["opponent_id"]]:
+        await finish_wager(wid,draw=True)
+        await query.message.edit_text("🤝 هر دو یک گزینه را انتخاب کردند؛ ورودی‌ها برگشت.")
+        return
+    number=random.randint(1,100)
+    winner_choice="even" if number%2==0 else "odd"
+    winner=w["creator_id"] if w["choices"][w["creator_id"]]==winner_choice else w["opponent_id"]
+    await finish_wager(wid,winner)
+    await query.message.edit_text(f"🎯 عدد قرعه: {number} — {'زوج 🔵' if winner_choice=='even' else 'فرد 🟣'}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")
+
+@dp.callback_query(F.data.startswith("wager:guess:"))
+async def wager_guess_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); guess=int(parts[3])
+    except Exception:
+        await query.answer("❌ حدس نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active":
+        await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if query.from_user.id != w["opponent_id"]:
+        await query.answer("🎯 فقط بازیکن دوم حدس می‌زند.",show_alert=True); return
+    target=random.randint(1,10)
+    if guess==target:
+        winner=w["opponent_id"]
+        await finish_wager(wid,winner)
+        text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
+    else:
+        winner=w["creator_id"]
+        await finish_wager(wid,winner)
+        text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
+    await query.message.edit_text(text)
+    await query.answer()
+
 @dp.callback_query(F.data=="user:daily")
 async def user_daily(query:CallbackQuery):
     ok,st,remain,reward=claim_daily_box(query.from_user.id)
@@ -2021,7 +2372,7 @@ async def user_shop(query:CallbackQuery):
     rows=[]
     for i,(title,cost) in enumerate(SHOP_ITEMS.items(),1): rows.append([button(f"{i}. {title} — {format_coins(cost)} 💎",f"shop:buy:{i}")])
     rows.append([button("🔙 برگشت","user:menu")])
-    await query.message.edit_text("🛍️ فروشگاه عنوان‌ها\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard(rows)); await query.answer()
+    await query.message.edit_text("🛍️ فروشگاه عنوان و آیتم‌های نمایشی\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard(rows)); await query.answer()
 
 @dp.callback_query(F.data.startswith("shop:buy:"))
 async def shop_buy(query:CallbackQuery):
@@ -2055,7 +2406,10 @@ async def user_leaderboard(query:CallbackQuery):
 
 @dp.callback_query(F.data=="user:games")
 async def user_games(query:CallbackQuery):
-    await query.message.edit_text("🎮 بازی‌های کوچک آریور\n\n🪙 شیر یا خط: «شیر یا خط 100»\n🔢 حدس عدد: «حدس عدد 7»\n\n💡 این بازی‌ها فقط با آریور داخل ربات هستند و پول واقعی در آن‌ها دخیل نیست.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+    await query.message.edit_text("🎮 بازی‌های شرطی دو نفره آریور 💎\n\n"
+"⭕️ دوز: «دوز 100»\n✊ سنگ کاغذ قیچی: «سنگ کاغذ قیچی 100»\n🃏 جنگ کارت: «جنگ کارت 100»\n🎯 زوج یا فرد: «زوج یا فرد 100»\n🔢 حدس عدد: «حدس عدد 100»\n📈 بالاتر: «بالاتر 100»\n\n"
+"👥 بازی با دو بازیکن انجام می‌شود. سازنده مبلغ ورودی را می‌پردازد و با شرکت نفر دوم، مجموع ورودی‌ها جایزه برنده می‌شود.\n"
+"⏰ اگر تا ۶۰ ثانیه کسی شرکت نکند، مبلغ سازنده کامل برمی‌گردد.\n🤝 در بازی‌های مساوی، ورودی هر دو نفر برمی‌گردد.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
 
 @dp.callback_query(F.data=="user:history")
 async def user_history(query:CallbackQuery):
@@ -2454,7 +2808,7 @@ async def handle_text(message: Message):
     if text in ("بانک","بانک آریور"):
         await message.reply(f"🏦 موجودی بانک: {format_coins(bank_balance(message.from_user.id))} آریور 💎"); return
     if text in ("فروشگاه","shop"):
-        await message.answer("🛍️ فروشگاه عنوان‌ها:\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard([[button(f"خرید عنوان {i}",f"shop:buy:{i}")] for i in range(1,len(SHOP_ITEMS)+1)])); return
+        await message.answer("🛍️ فروشگاه عنوان و آیتم‌های نمایشی:\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard([[button(f"خرید عنوان {i}",f"shop:buy:{i}")] for i in range(1,len(SHOP_ITEMS)+1)])); return
     m=re.fullmatch(r"خرید عنوان\s+(\d+)",text)
     if m:
         idx=int(m.group(1));
@@ -2525,6 +2879,40 @@ async def handle_text(message: Message):
             transfer_pending[message.from_user.id]=("confirm",state,target.id,target.username or "")
             label='@'+target.username if target.username else f'کاربر {target.id}'
             await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(state)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
+
+    # Player-vs-player wager games.
+    wager_patterns = [
+        (r"دوز\s+([0-9][0-9,]*)", "dooz"),
+        (r"سنگ\s+کاغذ\s+قیچی\s+([0-9][0-9,]*)", "rps"),
+        (r"جنگ\s+کارت\s+([0-9][0-9,]*)", "cards"),
+        (r"زوج\s+یا\s+فرد\s+([0-9][0-9,]*)", "evenodd"),
+        (r"حدس\s+عدد\s+([0-9][0-9,]*)", "guess"),
+        (r"بالاتر\s+([0-9][0-9,]*)", "higher"),
+    ]
+    for pattern, game_type in wager_patterns:
+        wm = re.fullmatch(pattern, text)
+        if wm:
+            stake = int(wm.group(1).replace(",", ""))
+            if stake <= 0:
+                await message.reply("❌ مبلغ ورودی باید بیشتر از صفر باشد. 💎")
+                return
+            wid, status = create_wager(message.chat.id, message.from_user.id, game_type, stake)
+            if status == "funds":
+                await message.reply(f"❌ برای ساخت این بازی حداقل {format_coins(stake)} آریور موجودی لازم داری. 💎")
+                return
+            name = WAGER_GAME_NAMES[game_type]
+            sent = await message.answer(
+                f"🎮 بازی «{name}» ساخته شد! 🔥\n\n"
+                f"👤 سازنده: {('@'+message.from_user.username) if message.from_user.username else message.from_user.full_name}\n"
+                f"💎 مبلغ ورودی هر نفر: {format_coins(stake)} آریور\n"
+                f"🏆 جایزه برنده: {format_coins(stake*2)} آریور\n"
+                f"⏳ فرصت شرکت: {WAGER_WAIT_SECONDS} ثانیه\n\n"
+                f"👥 یک نفر روی «شرکت کردن» بزند تا بازی شروع شود.",
+                reply_markup=wager_invite_keyboard(wid)
+            )
+            set_wager_message(wid, sent.message_id)
+            asyncio.create_task(wager_expiry_task(wid))
+            return
 
     # Safe in-game mini-games using Arioor only.
     if text.startswith("شیر یا خط"):
