@@ -495,6 +495,13 @@ COMBAT_POWER = {
     "🤖 ربات مبارز": 28,
     "🕸️ قهرمان تارزن": 30,
     "🧙 جادوگر سایه": 35,
+    # تجهیزات شوشول بری قدرت مبارزه ندارند؛ اثرشان روی شانس شوشول بری است.
+    "🔪 چاقوی دول‌بری": 0,
+    "✂️ قیچی": 0,
+    "🪚 اره‌برقی": 0,
+    "🔪 دول‌بُر": 0,
+    "🛡️ شوشول طلایی": 0,
+    "💘 معشوق شوشول": 0,
 }
 
 BLACK_SHOP_ITEMS = {
@@ -3374,7 +3381,12 @@ async def handle_shoshol_bari(message):
 def black_shop_text():
     lines=["🕶️ فروشگاه سیاه — تجهیزات مبارزه ⚔️\n"]
     for i,(item,(cost,desc)) in enumerate(BLACK_SHOP_ITEMS.items(),1):
-        lines.append(f"{i}. {item} — 💎 {format_coins(cost)}\n   ⚔️ قدرت: +{COMBAT_POWER[item]} | {desc}")
+        power = COMBAT_POWER.get(item, 0)
+        if power > 0:
+            effect = f"⚔️ قدرت مبارزه: +{power}"
+        else:
+            effect = f"✨ {desc}"
+        lines.append(f"{i}. {item} — 💎 {format_coins(cost)}\n   {effect}")
     return "\n".join(lines)
 
 def black_shop_keyboard():
