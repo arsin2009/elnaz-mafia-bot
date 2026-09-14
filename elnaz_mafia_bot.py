@@ -19,7 +19,7 @@ from aiogram.types import (
 # ================================================================
 # CONFIG
 # ================================================================
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required.")
 
