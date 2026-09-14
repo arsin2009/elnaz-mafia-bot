@@ -28,8 +28,11 @@ DB = os.getenv("DB_PATH", "elnaz_mafia.sqlite3")
 MIN_PLAYERS = 5
 MAX_PLAYERS = 18
 SETUP_REPEAT_SECONDS = 20
-COIN_REWARD = 20
+COIN_BASE_REWARD = 20
 COIN_COOLDOWN = 300
+LEVEL_AH_COUNT = 10
+LEVEL_UP_REWARD = 1000
+MAX_STAT_LEVEL = 10
 COIN_PHRASE = "عاح"
 ROLE_DM_SECONDS = 120
 SPEAK_SECONDS = 100
@@ -93,6 +96,7 @@ MAFIA_ROLES = {"رییس مافیا", "دکتر لکتر", "مافیا ساده"
 games = {}
 pending_link = {}
 pending_admin = {}
+transfer_pending = {}
 
 # ================================================================
 # DATABASE
@@ -108,7 +112,11 @@ def init_db():
             "id INTEGER PRIMARY KEY, username TEXT, started INTEGER DEFAULT 1)"
         )
         c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS coins(user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, last_ah INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS coins(user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, last_ah INTEGER DEFAULT 0, ah_count INTEGER DEFAULT 0, level INTEGER DEFAULT 0, luck_level INTEGER DEFAULT 0, exp_level INTEGER DEFAULT 0)")
+        cols = {row[1] for row in c.execute("PRAGMA table_info(coins)").fetchall()}
+        for name in ("ah_count", "level", "luck_level", "exp_level"):
+            if name not in cols:
+                c.execute(f"ALTER TABLE coins ADD COLUMN {name} INTEGER DEFAULT 0")
         c.execute("CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY, amount INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS gift_redemptions(code TEXT NOT NULL, user_id INTEGER NOT NULL, redeemed_at INTEGER NOT NULL, PRIMARY KEY(code,user_id))")
         c.commit()
@@ -157,30 +165,66 @@ def get_link_chat_id(slot):
 # ================================================================
 # COINS / GIFT CODES
 # ================================================================
-def get_balance(user_id):
+def get_coin_row(user_id):
     with db() as c:
-        row = c.execute("SELECT balance FROM coins WHERE user_id=?", (user_id,)).fetchone()
-        return int(row[0]) if row else 0
+        row=c.execute("SELECT balance,last_ah,ah_count,level,luck_level,exp_level FROM coins WHERE user_id=?",(user_id,)).fetchone()
+    if not row:
+        return {"balance":0,"last_ah":0,"ah_count":0,"level":0,"luck_level":0,"exp_level":0}
+    return {"balance":int(row[0] or 0),"last_ah":int(row[1] or 0),"ah_count":int(row[2] or 0),"level":int(row[3] or 0),"luck_level":int(row[4] or 0),"exp_level":int(row[5] or 0)}
 
+def get_balance(user_id): return get_coin_row(user_id)["balance"]
 
-def add_coins(user_id, amount):
+def add_coins(user_id,amount):
     with db() as c:
-        c.execute("INSERT INTO coins(user_id,balance,last_ah) VALUES(?,?,0) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance", (user_id, amount))
+        c.execute("INSERT INTO coins(user_id,balance,last_ah,ah_count,level,luck_level,exp_level) VALUES(?,?,0,0,0,0,0) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance",(user_id,int(amount)))
         c.commit()
     return get_balance(user_id)
 
+def coin_cooldown(user_id): return get_coin_row(user_id)["last_ah"]
 
-def coin_cooldown(user_id):
+def set_coin_time(user_id,ts):
     with db() as c:
-        row = c.execute("SELECT last_ah FROM coins WHERE user_id=?", (user_id,)).fetchone()
-    return int(row[0]) if row else 0
-
-
-def set_coin_time(user_id, ts):
-    with db() as c:
-        c.execute("INSERT INTO coins(user_id,balance,last_ah) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_ah=excluded.last_ah", (user_id, 0, ts))
+        c.execute("INSERT INTO coins(user_id,balance,last_ah,ah_count,level,luck_level,exp_level) VALUES(?,?,?,0,0,0,0) ON CONFLICT(user_id) DO UPDATE SET last_ah=excluded.last_ah",(user_id,0,int(ts)))
         c.commit()
 
+def process_ah(user_id):
+    r=get_coin_row(user_id); count=r["ah_count"]+1; level=r["level"]
+    leveled=False; level_reward=0
+    if count % LEVEL_AH_COUNT == 0:
+        level+=1; leveled=True; level_reward=LEVEL_UP_REWARD
+    reward=COIN_BASE_REWARD+level*100
+    with db() as c:
+        c.execute("INSERT INTO coins(user_id,balance,last_ah,ah_count,level,luck_level,exp_level) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance,last_ah=excluded.last_ah,ah_count=excluded.ah_count,level=excluded.level",(user_id,reward+level_reward,int(time.time()),count,level,r["luck_level"],r["exp_level"]))
+        c.commit()
+    return {**get_coin_row(user_id),"reward":reward,"level_reward":level_reward,"leveled_up":leveled}
+
+def upgrade_level(user_id):
+    r=get_coin_row(user_id); cost=10000
+    if r["balance"]<cost: return False,r,cost
+    with db() as c:
+        c.execute("UPDATE coins SET balance=balance-?,level=level+1 WHERE user_id=?",(cost,user_id)); c.commit()
+    return True,get_coin_row(user_id),cost
+
+def upgrade_stat(user_id,stat):
+    r=get_coin_row(user_id); cur=r[stat]
+    if cur>=MAX_STAT_LEVEL: return False,r,0,"max"
+    cost=(cur+1)*10000
+    if r["balance"]<cost: return False,r,cost,"funds"
+    with db() as c:
+        c.execute(f"UPDATE coins SET balance=balance-?,{stat}={stat}+1 WHERE user_id=?",(cost,user_id)); c.commit()
+    return True,get_coin_row(user_id),cost,"ok"
+
+def do_trade(user_id,amount):
+    r=get_coin_row(user_id)
+    if amount not in (100,1000,10000): return None,r,"amount"
+    if r["balance"]<amount: return None,r,"funds"
+    win=min(80,r["luck_level"]*4+r["exp_level"]*4)
+    if random.random()<win/100: net=random.randint(1,amount-1)
+    else: net=-random.randint(1,amount-1)
+    payout=amount+net
+    with db() as c:
+        c.execute("UPDATE coins SET balance=balance-?+? WHERE user_id=?",(amount,payout,user_id)); c.commit()
+    return net,get_coin_row(user_id),"ok"
 
 def active_gifts():
     with db() as c:
@@ -320,8 +364,12 @@ async def mute_all_alive(chat_id, game):
 
 def label_player(player):
     if player.get("username"):
-        return f'{player["id"]} (@{player["username"]})'
-    return str(player["id"])
+        return f'@{player["username"]}'
+    return f'کاربر {player["id"]}'
+
+def display_user(game,user_id):
+    p=get_player(game,user_id)
+    return label_player(p) if p else f'کاربر {user_id}'
 
 
 def check_win(game):
@@ -608,7 +656,7 @@ async def start_game_setup(message):
     games[message.chat.id] = game
 
     sent = await message.answer(
-        "بدون ارسین من میخاین بازی کنین؟ باشه ولی دفعه اخرتون باشه",
+        "🎭 بدون آرسین می‌خواین بازی کنین؟ باشه، ولی دفعه آخرتون باشه 😤😂",
         reply_markup=keyboard(
             [[button("شروع بازی", "game:start"), button("لغو بازی", "game:cancel")]]
         ),
@@ -627,7 +675,7 @@ async def repeat_setup_message(chat_id):
         try:
             sent = await send_bot_message(
                 chat_id,
-                "بدون ارسین من میخاین بازی کنین؟ باشه ولی دفعه اخرتون باشه",
+                "🎭 بدون آرسین می‌خواین بازی کنین؟ باشه، ولی دفعه آخرتون باشه 😤😂",
                 reply_markup=keyboard(
                     [[button("شروع بازی", "game:start"), button("لغو بازی", "game:cancel")]]
                 ),
@@ -672,7 +720,7 @@ async def callback_start(query: CallbackQuery):
     if not await creator_only(query, game):
         return
     game["phase"] = "setup"
-    await query.message.edit_text("تعداد پلیر را انتخاب کنید:", reply_markup=setup_keyboard(game))
+    await query.message.edit_text("👥 تعداد پلیرها را انتخاب کنید:", reply_markup=setup_keyboard(game))
     await query.answer()
 
 
@@ -692,7 +740,7 @@ async def callback_setup(query: CallbackQuery):
     elif action == "next":
         game["selected_roles"] = {}
         game["phase"] = "roles"
-        await query.message.edit_text("نقش های بازی را انتخاب کنید", reply_markup=role_selection_keyboard(game))
+        await query.message.edit_text("🎭 نقش‌های بازی را انتخاب کنید", reply_markup=role_selection_keyboard(game))
         await query.answer()
         return
 
@@ -804,7 +852,7 @@ async def callback_join(query: CallbackQuery):
 # ================================================================
 async def distribute_roles(chat_id):
     game = games.get(chat_id)
-    if not game:
+    if not game or game.get("phase") != "join":
         return
 
     game["phase"] = "rolesent"
@@ -824,7 +872,8 @@ async def distribute_roles(chat_id):
             player["alive"] = False
             player["reason"] = "نتوانست نقش را در پیوی دریافت کند"
 
-    await send_bot_message(chat_id, "نقش ها به پیوی ارسال شد. تا ۲ دقیقه دیگر بازی شروع می‌شود.")
+    sent=await send_bot_message(chat_id,"🎭 نقش‌ها به پیوی ارسال شد. ⏳ تا ۲ دقیقه دیگر بازی شروع می‌شود. 🌙",reply_markup=keyboard([[timer_button(ROLE_DM_SECONDS,"زمان شروع")]]))
+    t=asyncio.create_task(countdown_task(chat_id,sent.message_id,now()+ROLE_DM_SECONDS,"rolesent","زمان شروع")); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
     await asyncio.sleep(ROLE_DM_SECONDS)
 
     if chat_id in games:
@@ -832,11 +881,38 @@ async def distribute_roles(chat_id):
 
 
 # ================================================================
+# LIVE COUNTDOWN
+# ================================================================
+def timer_button(seconds,label="زمان"):
+    return button(f"⏳ {label}: {max(0,int(seconds))} ثانیه باقی‌مانده", "timer:noop")
+
+async def countdown_task(chat_id,message_id,deadline,phase,label,base_rows=None):
+    last=-1
+    while True:
+        game=games.get(chat_id)
+        if not game or game.get("phase")!=phase: return
+        left=max(0,int(deadline-now()))
+        if left!=last:
+            try:
+                rows=list(base_rows or [])
+                rows.append([timer_button(left,label)])
+                await bot.edit_message_reply_markup(chat_id,message_id,reply_markup=keyboard(rows))
+            except Exception: pass
+            last=left
+        if left<=0:return
+        await asyncio.sleep(1)
+
+@dp.callback_query(F.data=="timer:noop")
+async def timer_noop(query:CallbackQuery): await query.answer("⏳ شمارش زمان زنده است.")
+
+# ================================================================
 # DAY / SPEAKING
 # ================================================================
 async def start_day(chat_id):
     game = games.get(chat_id)
     if not game:
+        return
+    if game.get("phase") == "day" and game.get("speaker") is not None:
         return
     if check_win(game):
         await finish_game(chat_id)
@@ -858,6 +934,9 @@ async def next_speaker(chat_id):
         await finish_game(chat_id)
         return
 
+    await delete_message_id(chat_id, game.get("speaker_message"))
+    game["speaker_message"] = None
+
     while game["speaker_index"] < len(game["speaker_order"]):
         user_id = game["speaker_order"][game["speaker_index"]]
         game["speaker_index"] += 1
@@ -872,18 +951,12 @@ async def next_speaker(chat_id):
         await allow_only_speaker(chat_id, game, user_id)
         sent = await send_bot_message(
             chat_id,
-            f"🎤 نوبت صحبت کاربر {user_id}\n⏱ ۱۰۰ ثانیه",
-            reply_markup=keyboard(
-                [
-                    [
-                        button("چالش", f"challenge:{user_id}"),
-                        button("رد صحبت", f"skip:{user_id}"),
-                    ]
-                ]
-            ),
+            f"🎤 نوبت صحبت {display_user(game,user_id)} است! 🗣️\n⏱️ {SPEAK_SECONDS} ثانیه فرصت داری.",
+            reply_markup=keyboard([[button("⚔️ چالش", f"challenge:{user_id}"),button("⏭️ رد صحبت", f"skip:{user_id}")],[timer_button(SPEAK_SECONDS,"زمان صحبت")]]),
         )
         game["speaker_message"] = sent.message_id
-        asyncio.create_task(speaker_timer(chat_id, user_id, SPEAK_SECONDS))
+        t=asyncio.create_task(speaker_timer(chat_id,user_id,SPEAK_SECONDS)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
+        t=asyncio.create_task(countdown_task(chat_id,sent.message_id,game["speaker_deadline"],"day","زمان صحبت",[[button("⚔️ چالش",f"challenge:{user_id}"),button("⏭️ رد صحبت",f"skip:{user_id}")]])); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
         return
 
     await vote_round(chat_id)
@@ -892,7 +965,10 @@ async def next_speaker(chat_id):
 async def speaker_timer(chat_id, user_id, seconds):
     await asyncio.sleep(seconds)
     game = games.get(chat_id)
-    if game and game["phase"] == "day" and game.get("speaker") == user_id:
+    if game and game.get("phase") == "day" and game.get("speaker") == user_id:
+        game["speaker"] = None
+        await delete_message_id(chat_id, game.get("speaker_message"))
+        game["speaker_message"] = None
         await next_speaker(chat_id)
 
 
@@ -905,10 +981,10 @@ async def callback_challenge(query: CallbackQuery):
     target = int(query.data.split(":", 1)[1])
     challenger = query.from_user.id
     if game.get("speaker") != target:
-        await query.answer("این نوبت تمام شده.", show_alert=True)
+        await query.answer("⏰ این نوبت تمام شده است.", show_alert=True)
         return
     if not get_player(game, challenger) or not get_player(game, challenger)["alive"]:
-        await query.answer("شما زنده نیستید.", show_alert=True)
+        await query.answer("💀 شما زنده نیستید.", show_alert=True)
         return
     if challenger == target:
         await query.answer("خودت نمی‌تونی خودت رو چالش کنی.", show_alert=True)
@@ -953,8 +1029,10 @@ async def callback_challenge_yes(query: CallbackQuery):
     game["speaker"] = target
     game["speaker_deadline"] = now() + CHALLENGE_SECONDS
     await allow_only_speaker(query.message.chat.id, game, target)
-    await send_bot_message(query.message.chat.id, f"نوبت چالش کاربر {target}؛ ۳۰ ثانیه")
-    asyncio.create_task(speaker_timer(query.message.chat.id, target, CHALLENGE_SECONDS))
+    sent=await send_bot_message(query.message.chat.id,f"⚔️ نوبت چالش {display_user(game,target)} است! 🗣️\n⏱️ {CHALLENGE_SECONDS} ثانیه فرصت داری.",reply_markup=keyboard([[timer_button(CHALLENGE_SECONDS,"زمان چالش")]]))
+    game["speaker_message"]=sent.message_id
+    t=asyncio.create_task(speaker_timer(query.message.chat.id,target,CHALLENGE_SECONDS)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
+    t=asyncio.create_task(countdown_task(query.message.chat.id,sent.message_id,game["speaker_deadline"],"day","زمان چالش")); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
     await query.answer()
 
 
@@ -971,7 +1049,7 @@ async def callback_challenge_no(query: CallbackQuery):
 
     await delete_message_id(query.message.chat.id, game.get("challenge_message"))
     game["challenge_message"] = None
-    await query.answer()
+    await query.answer("❌ چالش رد شد.")
 
 
 @dp.callback_query(F.data.startswith("skip:"))
@@ -979,7 +1057,10 @@ async def callback_skip(query: CallbackQuery):
     game = games.get(query.message.chat.id)
     if not game or game.get("speaker") != int(query.data.split(":", 1)[1]):
         return
-    await query.answer()
+    await query.answer("⏭️ صحبت رد شد.")
+    await delete_message_id(query.message.chat.id, game.get("speaker_message"))
+    game["speaker_message"] = None
+    game["speaker"] = None
     await next_speaker(query.message.chat.id)
 
 
@@ -1007,17 +1088,16 @@ async def vote_round(chat_id):
         threshold = vote_threshold(game)
         sent = await send_bot_message(
             chat_id,
-            f'رای برای کاربر {target_player["id"]}\nحد نصاب: {threshold}',
+            f'🗳️ رای‌گیری برای {display_user(game,target_player["id"])}\n🎯 حد نصاب: {threshold}',
             reply_markup=keyboard(
                 [
-                    [
-                        button("رای", f"vote:{target_player['id']}"),
-                        button("تعداد رای: 0", f"vote_count:{target_player['id']}"),
-                    ]
+                    [button("🗳️ رای", f"vote:{target_player['id']}")],
+                    [timer_button(VOTE_SECONDS,"زمان رای")]
                 ]
             ),
         )
         game["vote_message"] = sent.message_id
+        t=asyncio.create_task(countdown_task(chat_id,sent.message_id,now()+VOTE_SECONDS,"vote","زمان رای",[[button("🗳️ رای",f"vote:{target_player['id']}")]])); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
         await asyncio.sleep(VOTE_SECONDS)
         await safe_delete(sent)
 
@@ -1036,7 +1116,7 @@ async def callback_vote(query: CallbackQuery):
 
     voter = get_player(game, query.from_user.id)
     if not voter or not voter["alive"]:
-        await query.answer("شما زنده نیستید.", show_alert=True)
+        await query.answer("💀 شما زنده نیستید.", show_alert=True)
         return
 
     target = int(query.data.split(":", 1)[1])
@@ -1059,7 +1139,7 @@ async def callback_vote(query: CallbackQuery):
         )
     except Exception:
         pass
-    await query.answer("رای ثبت شد")
+    await query.answer("🗳️ رای ثبت شد")
 
 
 @dp.callback_query(F.data.startswith("vote_count:"))
@@ -1081,10 +1161,31 @@ async def defense_phase(chat_id, user_id):
         return
 
     game["phase"] = "defense"
+    game["speaker"] = user_id
+    game["speaker_deadline"] = now()+DEFENSE_SECONDS
     await allow_only_speaker(chat_id, game, user_id)
-    await send_bot_message(chat_id, f"کاربر {user_id} به دفاع رفت؛ ۱۰۰ ثانیه فرصت صحبت دارد.")
+    sent=await send_bot_message(chat_id,f"🛡️ {display_user(game,user_id)} به دفاع رفت! 🎤\n⏱️ {DEFENSE_SECONDS} ثانیه فرصت داری.",reply_markup=keyboard([[button("⏭️ رد دفاع",f"defense_skip:{user_id}")],[timer_button(DEFENSE_SECONDS,"زمان دفاع")]]))
+    game["defense_message"]=sent.message_id
+    t=asyncio.create_task(defense_timer(chat_id,user_id)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
+    t=asyncio.create_task(countdown_task(chat_id,sent.message_id,game["speaker_deadline"],"defense","زمان دفاع",[[button("⏭️ رد دفاع",f"defense_skip:{user_id}")]])); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
+
+async def defense_timer(chat_id,user_id):
     await asyncio.sleep(DEFENSE_SECONDS)
-    await final_vote(chat_id, user_id)
+    game=games.get(chat_id)
+    if game and game.get("phase")=="defense" and game.get("speaker")==user_id:
+        await delete_message_id(chat_id,game.get("defense_message")); game["defense_message"]=None
+        await final_vote(chat_id,user_id)
+
+@dp.callback_query(F.data.startswith("defense_skip:"))
+async def defense_skip(query:CallbackQuery):
+    game=games.get(query.message.chat.id)
+    if not game or game.get("phase")!="defense": return
+    uid=int(query.data.split(":",1)[1])
+    if query.from_user.id!=uid:
+        await query.answer("❌ فقط خود فردِ در دفاع می‌تواند دفاعش را رد کند.",show_alert=True); return
+    await query.answer("⏭️ دفاع رد شد.")
+    await delete_message_id(query.message.chat.id,game.get("defense_message")); game["defense_message"]=None
+    await final_vote(query.message.chat.id,uid)
 
 
 async def final_vote(chat_id, user_id):
@@ -1100,17 +1201,18 @@ async def final_vote(chat_id, user_id):
     threshold = vote_threshold(game)
     sent = await send_bot_message(
         chat_id,
-        f"رای نهایی برای کاربر {user_id}\nحد نصاب: {threshold}",
+        f"🗳️ رای نهایی برای {display_user(game,user_id)}\n🎯 حد نصاب: {threshold}",
         reply_markup=keyboard(
             [
                 [
-                    button("رای", f"final_vote:{user_id}"),
-                    button("تعداد رای: 0", f"final_vote_count:{user_id}"),
+                    button("🗳️ رای", f"final_vote:{user_id}"),
+                    button("🔢 تعداد رای: 0", f"final_vote_count:{user_id}"),
                 ]
             ]
         ),
     )
     game["vote_message"] = sent.message_id
+    t=asyncio.create_task(countdown_task(chat_id,sent.message_id,now()+VOTE_SECONDS,"final_vote","زمان رای نهایی",[[button("🗳️ رای",f"final_vote:{user_id}")]])); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
     await asyncio.sleep(VOTE_SECONDS)
     await safe_delete(sent)
 
@@ -1129,7 +1231,7 @@ async def callback_final_vote(query: CallbackQuery):
 
     voter = get_player(game, query.from_user.id)
     if not voter or not voter["alive"]:
-        await query.answer("شما زنده نیستید.", show_alert=True)
+        await query.answer("💀 شما زنده نیستید.", show_alert=True)
         return
 
     target = int(query.data.split(":", 1)[1])
@@ -1152,7 +1254,7 @@ async def callback_final_vote(query: CallbackQuery):
         )
     except Exception:
         pass
-    await query.answer("رای ثبت شد")
+    await query.answer("🗳️ رای ثبت شد")
 
 
 @dp.callback_query(F.data.startswith("final_vote_count:"))
@@ -1174,15 +1276,17 @@ def target_keyboard(game, action, *, mafia_only=False, allow_none=False, exclude
             continue
         if mafia_only and p["role"] not in MAFIA_ROLES:
             continue
-        rows.append([button(str(p["id"]), f"night:{action}:{p['id']}")])
+        rows.append([button(f"👤 {label_player(p)}", f"night:{action}:{p['id']}")])
     if allow_none:
-        rows.append([button("انتخاب نمیکنم", f"night:{action}:none")])
+        rows.append([button("⏭️ انتخاب نمی‌کنم", f"night:{action}:none")])
     return keyboard(rows)
 
 
 async def night_phase(chat_id):
     game = games.get(chat_id)
     if not game:
+        return
+    if game.get("phase") == "night":
         return
     if check_win(game):
         await finish_game(chat_id)
@@ -1198,11 +1302,9 @@ async def night_phase(chat_id):
     game["night_log"] = []
 
     await mute_all_alive(chat_id, game)
-    night_message = await send_bot_message(
-        chat_id,
-        "شب میشه و پلیر ها به داخل پیوی ربات بیان (به غیر از شهروند های ساده)\n⏱ ۲ دقیقه",
-    )
+    night_message = await send_bot_message(chat_id,"🌙 شب شد! بازیکنان نقش‌دار به پیوی ربات بیان. 🤖\n🚫 شهروندهای ساده نیاز به اقدام ندارند.",reply_markup=keyboard([[timer_button(NIGHT_SECONDS,"زمان شب")]]))
     game["night_message"] = night_message.message_id
+    t=asyncio.create_task(countdown_task(chat_id,night_message.message_id,now()+NIGHT_SECONDS,"night","زمان شب")); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
 
     # Choose the current mafia kill selector.
     boss = next((p for p in alive(game) if p["role"] == "رییس مافیا"), None)
@@ -1223,26 +1325,26 @@ async def night_phase(chat_id):
             if role == "دکتر":
                 await send_bot_message(
                     p["id"],
-                    "لطفا یک پلیر رو برای سیو شب انتخاب کنید",
+                    "💉 لطفاً یک پلیر را برای سیو شب انتخاب کنید. 🛡️",
                     reply_markup=target_keyboard(game, "doctor", exclude_self=p["id"]),
                 )
             elif role == "کاراگاه":
                 await send_bot_message(
                     p["id"],
-                    "یک کاربر را برای استعلام شب انتخاب کنید",
+                    "🔎 یک کاربر را برای استعلام شب انتخاب کنید. 🕵️",
                     reply_markup=target_keyboard(game, "detective", exclude_self=p["id"]),
                 )
             elif role == "تک تیر انداز":
                 await send_bot_message(
                     p["id"],
-                    "یک کاربر را برای زدن انتخاب کنید؛ اگر شهروند باشد خودتان از بازی خارج می‌شوید.",
+                    "🎯 یک کاربر را برای شلیک انتخاب کنید؛ اگر شهروند باشد خودتان از بازی خارج می‌شوید. ⚠️",
                     reply_markup=target_keyboard(game, "sniper", allow_none=True, exclude_self=p["id"]),
                 )
             elif role == "جان سخت":
                 used = game["hard_used"].get(p["id"], 0)
                 await send_bot_message(
                     p["id"],
-                    f"ایا استعلام میگیری ؟؟ (حداکثر ۲ بار)\nاستفاده شده: {used}/2",
+                    f"🧠 آیا استعلام میگیری؟ (حداکثر ۲ بار)\nاستفاده شده: {used}/2",
                     reply_markup=keyboard(
                         [
                             [
@@ -1261,43 +1363,43 @@ async def night_phase(chat_id):
                 )
             elif role == "فروشنده":
                 if p["id"] in game["seller_used"]:
-                    await send_bot_message(p["id"], "فروشنده قبلاً از قابلیت خود استفاده کرده است.")
+                    await send_bot_message(p["id"], "🛒 فروشنده قبلاً از قابلیت خود استفاده کرده است. ⛔")
                 else:
                     await send_bot_message(
                         p["id"],
-                        "یک کاربر را برای فروش نقش انتخاب کنید (تنها یک بار)",
+                        "🛒 یک کاربر را برای فروش نقش انتخاب کنید (تنها یک بار). 🎭",
                         reply_markup=target_keyboard(game, "seller", allow_none=True, exclude_self=p["id"]),
                     )
             elif role == "رییس مافیا":
                 await send_bot_message(
                     p["id"],
-                    "یک کاربر را برای کشته شب انتخاب کنید",
+                    "🔪 یک کاربر را برای کشته شب انتخاب کنید. 🌙",
                     reply_markup=target_keyboard(game, "boss", exclude_self=p["id"]),
                 )
             elif role == "دکتر لکتر":
                 await send_bot_message(
                     p["id"],
-                    "یکی از مافیا ها را برای سیو انتخاب کنید",
+                    "🛡️ یکی از مافیاها را برای سیو انتخاب کنید. 🩺",
                     reply_markup=target_keyboard(game, "lector_save", mafia_only=True, exclude_self=p["id"]),
                 )
                 # If the boss is dead, Lecter is also the kill selector.
                 if game["kill_selector"] == p["id"]:
                     await send_bot_message(
                         p["id"],
-                        "رییس مافیا داخل بازی نیست؛ شما مسئول انتخاب کشته شب هستید.",
+                        "👑 رییس مافیا داخل بازی نیست؛ شما مسئول انتخاب کشته شب هستید. 🔪",
                         reply_markup=target_keyboard(game, "kill", exclude_self=p["id"]),
                     )
             elif role == "مافیا ساده":
                 if game["kill_selector"] == p["id"]:
                     await send_bot_message(
                         p["id"],
-                        "رییس مافیا و دکتر لکتر داخل بازی نیستند؛ شما مسئول انتخاب کشته شب هستید.",
+                        "👑 رییس مافیا و دکتر لکتر داخل بازی نیستند؛ شما مسئول انتخاب کشته شب هستید. 🔪",
                         reply_markup=target_keyboard(game, "kill", exclude_self=p["id"]),
                     )
                 else:
                     await send_bot_message(
                         p["id"],
-                        "یک کاربر را برای مشورت به مسئول کشته شب پیشنهاد بده",
+                        "💬 یک کاربر را برای مشورت به مسئول کشته شب پیشنهاد بده. 🔪",
                         reply_markup=target_keyboard(game, "mafia_suggest", exclude_self=p["id"]),
                     )
         except Exception:
@@ -1335,7 +1437,7 @@ async def callback_night(query: CallbackQuery):
     if action == "doctor":
         game["doctor_save"] = target_id
         game["night_actions"][player["id"]] = {"action": "doctor", "target": target_id}
-        await query.message.edit_text(f"شما کاربر {target_id} را نجات دادید")
+        await query.message.edit_text(f"🛡️ شما {display_user(game,target_id)} را برای سیو انتخاب کردید. ✅")
         await query.answer()
         return
 
@@ -1343,18 +1445,18 @@ async def callback_night(query: CallbackQuery):
     if action == "detective":
         target = get_player(game, target_id)
         if not target:
-            await query.answer("کاربر نامعتبر است.", show_alert=True)
+            await query.answer("❌ کاربر نامعتبر است. 👤", show_alert=True)
             return
         result = "شهروند" if target["role"] == "رییس مافیا" or side(target["role"]) == "citizen" else "مافیا"
         game["night_actions"][player["id"]] = {"action": "detective", "target": target_id}
-        await query.message.edit_text(f"نتیجه استعلام: کاربر {target_id} = {result}")
+        await query.message.edit_text(f"🔎 نتیجه استعلام: {display_user(game,target_id)} = {result} 🕵️")
         await query.answer()
         return
 
     # Sniper
     if action == "sniper":
         game["night_actions"][player["id"]] = {"action": "sniper", "target": target_id}
-        await query.message.edit_text("انتخاب شما ثبت شد.")
+        await query.message.edit_text("✅ انتخاب شما ثبت شد. 🎯")
         await query.answer()
         return
 
@@ -1368,12 +1470,12 @@ async def callback_night(query: CallbackQuery):
             game["hard_used"][player["id"]] = used + 1
             game["night_actions"][player["id"]] = {"action": "hard", "used": used + 1}
             report = "\n".join(
-                f'{p["id"]}: {p["role"]}' for p in game["players"] if not p["alive"]
+                f'{label_player(p)}: {p["role"]} 🎭' for p in game["players"] if not p["alive"]
             ) or "هنوز بازیکن حذف‌شده‌ای وجود ندارد."
-            await query.message.edit_text("گزارش بازیکن‌های حذف‌شده:\n" + report)
+            await query.message.edit_text("📋 گزارش بازیکن‌های حذف‌شده:\n" + report)
         else:
             game["night_actions"][player["id"]] = {"action": "hard_no"}
-            await query.message.edit_text("استعلام این شب انجام نشد.")
+            await query.message.edit_text("⏭️ استعلام این شب انجام نشد. 🌙")
         await query.answer()
         return
 
@@ -1382,7 +1484,7 @@ async def callback_night(query: CallbackQuery):
         used = game["psy_used"].get(player["id"], 0)
         if target_id is None:
             game["night_actions"][player["id"]] = {"action": "psycho", "target": None}
-            await query.message.edit_text("این شب کسی را ساکت نکردید.")
+            await query.message.edit_text("🤫 این شب کسی را ساکت نکردید. 🔇")
             await query.answer()
             return
         if used >= 2:
@@ -1390,7 +1492,7 @@ async def callback_night(query: CallbackQuery):
             return
         game["psy_used"][player["id"]] = used + 1
         game["night_actions"][player["id"]] = {"action": "psycho", "target": target_id}
-        await query.message.edit_text(f"کاربر {target_id} برای روز بعد ساکت شد.")
+        await query.message.edit_text(f"🤫 {display_user(game,target_id)} برای روز بعد ساکت شد. 🔇")
         await query.answer()
         return
 
@@ -1401,7 +1503,7 @@ async def callback_night(query: CallbackQuery):
             return
         game["seller_used"].add(player["id"])
         game["night_actions"][player["id"]] = {"action": "seller", "target": target_id}
-        await query.message.edit_text("انتخاب شما ثبت شد.")
+        await query.message.edit_text("✅ انتخاب شما ثبت شد. 🎯")
         await query.answer()
         return
 
@@ -1412,7 +1514,7 @@ async def callback_night(query: CallbackQuery):
             return
         game["mafia_target"] = target_id
         game["night_actions"][player["id"]] = {"action": "kill", "target": target_id}
-        await query.message.edit_text("انتخاب کشته شب ثبت شد.")
+        await query.message.edit_text("🔪 انتخاب کشته شب ثبت شد. 🌙")
         await query.answer()
         return
 
@@ -1427,7 +1529,7 @@ async def callback_night(query: CallbackQuery):
                 return
         game["lecter_save"] = target_id
         game["night_actions"][player["id"]] = {"action": "lector_save", "target": target_id}
-        await query.message.edit_text("سیو دکتر لکتر ثبت شد.")
+        await query.message.edit_text("🛡️ سیو دکتر لکتر ثبت شد. ✅")
         await query.answer()
         return
 
@@ -1438,7 +1540,7 @@ async def callback_night(query: CallbackQuery):
             return
         game["mafia_target"] = target_id
         game["night_actions"][player["id"]] = {"action": "kill", "target": target_id}
-        await query.message.edit_text("انتخاب کشته شب ثبت شد.")
+        await query.message.edit_text("🔪 انتخاب کشته شب ثبت شد. 🌙")
         await query.answer()
         return
 
@@ -1449,9 +1551,9 @@ async def callback_night(query: CallbackQuery):
         if selector:
             await send_bot_message(
                 selector["id"],
-                f'مافیا ساده با آیدی {player["id"]} پیشنهاد داد کاربر {target_id} کشته شود.',
+                f'💬 {display_user(game,player["id"])} پیشنهاد داد {display_user(game,target_id)} کشته شود. 🔪',
             )
-        await query.message.edit_text("پیشنهاد شما برای مسئول کشته ارسال شد.")
+        await query.message.edit_text("💬 پیشنهاد شما برای مسئول کشته ارسال شد. 🔪")
         await query.answer()
         return
 
@@ -1510,7 +1612,7 @@ async def resolve_night(chat_id):
         target = get_player(game, action.get("target"))
         if target and target["alive"]:
             game["silent_next_day"].add(target["id"])
-            game["night_log"].append(f'کاربر {target["id"]} برای روز بعد ساکت شد.')
+            game["night_log"].append(f'🤫 {display_user(game,target["id"])} برای روز بعد ساکت شد. 🔇')
 
     # Sniper.
     sniper = next((p for p in alive(game) if p["role"] == "تک تیر انداز"), None)
@@ -1531,7 +1633,7 @@ async def resolve_night(chat_id):
     if target and target["alive"] and game.get("doctor_save") != target["id"]:
         if target["role"] == "جان سخت" and target["id"] not in game["hard_immune"]:
             game["hard_immune"].add(target["id"])
-            game["night_log"].append(f'جان سخت {target["id"]} برای اولین شلیک مافیا زنده ماند.')
+            game["night_log"].append(f'🛡️ {display_user(game,target["id"])} (جان سخت) برای اولین شلیک مافیا زنده ماند.')
         else:
             await eliminate_player(chat_id, target["id"], "کشته شب")
 
@@ -1546,19 +1648,18 @@ async def resolve_night(chat_id):
 
     if game["night_deaths"]:
         lines.append(
-            "کشته‌های شب: "
-            + ", ".join(str(item[0]) for item in game["night_deaths"])
+            "☠️ کشته‌های شب: "
+            + ", ".join(display_user(game,item[0]) for item in game["night_deaths"])
         )
     else:
         lines.append("کسی در شب کشته نشد.")
 
     expelled = [
-        str(p["id"])
-        for p in game["players"]
+        p for p in game["players"]
         if (not p["alive"] and "نبودن داخل بازی" in p.get("reason", ""))
     ]
     if expelled:
-        lines.append("اخراج به دلیل نبودن: " + ", ".join(expelled))
+        lines.append("🚫 اخراج به دلیل نبودن: " + ", ".join(label_player(p) for p in expelled))
 
     await send_bot_message(chat_id, "\n".join(lines))
 
@@ -1586,17 +1687,95 @@ async def finish_game(chat_id):
     winner = game["winner"]
     winning_side = "mafia" if winner == "مافیا" else "citizen"
     winners = [
-        str(p["id"])
+        label_player(p)
         for p in game["players"]
         if p["alive"] and side(p["role"]) == winning_side
     ]
 
     await send_bot_message(
         chat_id,
-        f"🏆 {winner} برنده شد!\n\nبازیکنان برنده:\n"
+        f"🏆 {winner} برنده شد! 🎉\n\n👑 بازیکنان برنده:\n"
         + ("\n".join(winners) or "ندارد"),
     )
 
+
+# ================================================================
+# USER MENU / ECONOMY
+# ================================================================
+def profile_text(uid):
+    r=get_coin_row(uid); win=min(80,r["luck_level"]*4+r["exp_level"]*4)
+    return (f"👤 منوی کاربر الناز ✨\n\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}")
+
+def user_menu_keyboard():
+    return keyboard([[button("⬆️ ارتقای لول","user:level")],[button("📈 ترید","user:trade")],[button("🍀 ارتقای لول شانس","user:luck")],[button("🧠 ارتقای لول تجربه","user:exp")],[button("💸 انتقال آریور","user:transfer")],[button("📚 راهنما","user:help")]])
+
+def trade_keyboard(): return keyboard([[button("🎲 ترید 100 آریور","trade:100")],[button("🎲 ترید 1,000 آریور","trade:1000")],[button("🎲 ترید 10,000 آریور","trade:10000")],[button("🔙 برگشت به منو","user:menu")]])
+
+def user_help_text():
+    return ("📚 راهنمای کامل الناز 🤖✨\n\n"
+            "💰 بخش آریور\n"
+            "• «عاح» → دریافت آریور هر ۵ دقیقه ⏰\n"
+            "• «موجودی» → نمایش موجودی 💰\n"
+            "• «منو» → نمایش پروفایل 👤\n"
+            "• «ترید 100» / «ترید 1000» / «ترید 10000» → ترید مستقیم 🎲\n"
+            "• «ارتقای لول» → ارتقای لول اصلی با هزینه 10,000 آریور ⬆️\n"
+            "• «ارتقای لول شانس» → افزایش شانس ترید 🍀\n"
+            "• «ارتقای لول تجربه» → افزایش تجربه ترید 🧠\n"
+            "• «انتقال 500» با ریپلای به کاربر → انتقال آریور 💸\n\n"
+            "🎭 بخش بازی مافیا\n"
+            "• «بازی مافیا» → شروع بازی 🎬\n"
+            "• «پایان بازی» / «بایان بازی» → پایان بازی 🛑\n"
+            "• «پایه‌ام» → ورود به بازی 👥\n"
+            "• دکمه‌های چالش، رد صحبت، رای و اقدامات شب → کنترل بازی 🎤🗳️🌙\n\n"
+            "💬 بخش گفتگو\n"
+            "• «الناز» → پاسخ الناز 💖\n"
+            "• «آرسین» یا «ارسین» → پاسخ مخصوص آرسین 😤\n"
+            "• «راهنما» / «راهنما الناز» → نمایش راهنما 📚\n\n"
+            "🔐 بخش ورود\n"
+            "• «/start» → ثبت‌نام و بررسی عضویت 🔗\n\n"
+            "👑 بخش مدیریت آرسین\n"
+            "• «🔗 لینک 1 / لینک 2» → تنظیم لینک‌های عضویت 🛡️\n"
+            "• «💰 افزایش موجودی» → شارژ آریور کاربر 🎁\n"
+            "• «🎁 کد هدیه» → ساخت کد هدیه 🎟️\n"
+            "• «📋 لیست کد هدیه» → مدیریت کدهای فعال 📋\n\n"
+            "🛠️ توسعه‌دهنده: @arsin_mo")
+
+@dp.callback_query(F.data=="user:menu")
+async def user_menu(query:CallbackQuery): await query.message.edit_text(profile_text(query.from_user.id),reply_markup=user_menu_keyboard()); await query.answer()
+
+@dp.callback_query(F.data=="user:trade")
+async def user_trade(query:CallbackQuery): await query.message.edit_text("📈 ترید آریور 🎲\n\nمبلغ را انتخاب کن:",reply_markup=trade_keyboard()); await query.answer()
+
+@dp.callback_query(F.data=="user:level")
+async def user_level(query:CallbackQuery):
+    ok,r,c=upgrade_level(query.from_user.id)
+    if not ok: await query.answer(f"❌ {format_coins(c)} آریور برای ارتقای لول لازم داری.",show_alert=True); return
+    await query.message.edit_text(f"🎉 لول ارتقا یافت! ⭐\n💸 {format_coins(c)} آریور کسر شد.\n\n{profile_text(query.from_user.id)}",reply_markup=user_menu_keyboard()); await query.answer()
+
+@dp.callback_query(F.data=="user:luck")
+async def user_luck(query:CallbackQuery):
+    ok,r,c,why=upgrade_stat(query.from_user.id,"luck_level")
+    if not ok: await query.answer("🏆 لول شانس کامل است." if why=="max" else f"❌ {format_coins(c)} آریور لازم داری.",show_alert=True); return
+    await query.message.edit_text(f"🍀 لول شانس ارتقا یافت!\n💸 {format_coins(c)} آریور کسر شد.\n\n{profile_text(query.from_user.id)}",reply_markup=user_menu_keyboard()); await query.answer()
+
+@dp.callback_query(F.data=="user:exp")
+async def user_exp(query:CallbackQuery):
+    ok,r,c,why=upgrade_stat(query.from_user.id,"exp_level")
+    if not ok: await query.answer("🏆 لول تجربه کامل است." if why=="max" else f"❌ {format_coins(c)} آریور لازم داری.",show_alert=True); return
+    await query.message.edit_text(f"🧠 لول تجربه ارتقا یافت!\n💸 {format_coins(c)} آریور کسر شد.\n\n{profile_text(query.from_user.id)}",reply_markup=user_menu_keyboard()); await query.answer()
+
+@dp.callback_query(F.data.startswith("trade:"))
+async def trade_callback(query:CallbackQuery):
+    amount=int(query.data.split(":",1)[1]); net,r,status=do_trade(query.from_user.id,amount)
+    if status=="funds": await query.answer("❌ موجودی آریورت کافی نیست.",show_alert=True); return
+    result=f"🟢 {format_coins(net)} آریور سود کردی! 📈" if net>0 else f"🔴 {format_coins(abs(net))} آریور ضرر کردی. 📉"
+    await query.message.edit_text(f"🎲 نتیجه ترید {format_coins(amount)} آریور\n\n{result}\n💰 موجودی جدید: {format_coins(r['balance'])} آریور",reply_markup=user_menu_keyboard()); await query.answer("🎲 ترید انجام شد!")
+
+@dp.callback_query(F.data=="user:help")
+async def user_help(query:CallbackQuery): await query.message.edit_text(user_help_text(),reply_markup=user_menu_keyboard()); await query.answer()
+
+@dp.callback_query(F.data=="user:transfer")
+async def user_transfer(query:CallbackQuery): transfer_pending[query.from_user.id]="amount"; await query.message.answer("💸 مقدار آریور را بفرست؛ بعد روی پیام فرد موردنظر ریپلای کن.\nمثال: 500"); await query.answer()
 
 # ================================================================
 # ARSIN COIN / GIFT ADMIN
@@ -1606,7 +1785,7 @@ async def admin_addcoins(query: CallbackQuery):
     if not is_arsin_user(query.from_user):
         await query.answer("فقط آرسین.", show_alert=True); return
     pending_admin[query.from_user.id] = "add_amount"
-    await query.message.answer("تعداد سکه را ارسال کنید")
+    await query.message.answer("تعداد آریور را ارسال کنید")
     await query.answer()
 
 
@@ -1615,12 +1794,12 @@ async def admin_gift(query: CallbackQuery):
     if not is_arsin_user(query.from_user):
         await query.answer("فقط آرسین.", show_alert=True); return
     pending_admin[query.from_user.id] = "gift_amount"
-    await query.message.answer("تعداد سکه را ارسال کنید")
+    await query.message.answer("تعداد آریور را ارسال کنید")
     await query.answer()
 
 
 def gift_keyboard():
-    rows = [[button(f"{code} — {format_coins(amount)} 🪙", f"gift:expire:{code}")] for code, amount in active_gifts()]
+    rows = [[button(f"{code} — {format_coins(amount)} 💎", f"gift:expire:{code}")] for code, amount in active_gifts()]
     return keyboard(rows) if rows else keyboard([[button("کد فعالی وجود ندارد", "gift:none")]])
 
 
@@ -1679,10 +1858,10 @@ async def command_start(message: Message):
         return
     if is_arsin_user(message.from_user):
         await message.answer(
-            "👑 پنل مدیریت الناز آماده است. 🛠️\n\n🪙 مدیریت سکه\n🎁 مدیریت کد هدیه\n🔗 مدیریت لینک‌ها",
+            "👑 پنل مدیریت الناز آماده است. 🛠️\n\n💎 مدیریت آریور\n🎁 مدیریت کد هدیه\n🔗 مدیریت لینک‌ها",
             reply_markup=keyboard([
                 [button("🔗 لینک 1", "link:1"), button("🔗 لینک 2", "link:2")],
-                [button("🪙 افزایش موجودی", "admin:addcoins")],
+                [button("💎 افزایش موجودی", "admin:addcoins")],
                 [button("🎁 کد هدیه", "admin:gift")],
                 [button("📋 لیست کد هدیه", "admin:gifts")],
             ]),
@@ -1713,7 +1892,7 @@ async def callback_check_membership(query: CallbackQuery):
     await query.message.answer(
         "🎉 عضویتت تأیید شد!\n\n"
         "🤖 من النازم؛ ربات اجرای بازی مافیا و امکانات گروه.\n\n"
-        "🎭 اجرای بازی مافیا\n🪙 سیستم سکه و موجودی\n🎁 کدهای هدیه\n👥 مدیریت مراحل بازی\n\n"
+        "🎭 اجرای بازی مافیا\n💎 سیستم آریور و موجودی\n🎁 کدهای هدیه\n👥 مدیریت مراحل بازی\n\n"
         "🛠 توسط @arsin_mo توسعه داده شده‌ام.",
         reply_markup=keyboard([[InlineKeyboardButton(text="➕ افزودن ربات به گروه", url=add_url)]])
     )
@@ -1742,7 +1921,7 @@ async def handle_text(message: Message):
                 amount = int(text)
                 if amount <= 0: raise ValueError
             except ValueError:
-                await message.answer("❌ تعداد سکه باید عدد مثبت باشد. 🪙"); return
+                await message.answer("❌ تعداد آریور باید عدد مثبت باشد. 💎"); return
             pending_admin[message.from_user.id] = ("add_user", amount)
             await message.answer("👤 آیدی کاربر را ارسال کن؛ مثلاً @arsin_mo")
             return
@@ -1758,9 +1937,9 @@ async def handle_text(message: Message):
             target_id = row[0]
             balance = add_coins(target_id, amount)
             pending_admin.pop(message.from_user.id, None)
-            await message.answer(f"✅ به کاربر {target_username} تعداد {format_coins(amount)} 🪙 سکه اضافه کردی.\n\n💰 موجودی جدید: {format_coins(balance)} 🪙")
+            await message.answer(f"✅ به کاربر {target_username} تعداد {format_coins(amount)} 💎 آریور اضافه کردی.\n\n💰 موجودی جدید: {format_coins(balance)} 💎")
             try:
-                await bot.send_message(target_id, f"🎁 {format_coins(amount)} 🪙 سکه به موجودی شما اضافه شد.\n💰 موجودی سکه‌ها: {format_coins(balance)} 🪙")
+                await bot.send_message(target_id, f"🎁 {format_coins(amount)} 💎 آریور به موجودی شما اضافه شد.\n💰 موجودی آریور‌ها: {format_coins(balance)} 💎")
             except Exception:
                 pass
             return
@@ -1769,7 +1948,7 @@ async def handle_text(message: Message):
                 amount = int(text)
                 if amount <= 0: raise ValueError
             except ValueError:
-                await message.answer("❌ تعداد سکه باید عدد مثبت باشد. 🎁"); return
+                await message.answer("❌ تعداد آریور باید عدد مثبت باشد. 🎁"); return
             pending_admin[message.from_user.id] = ("gift_code", amount)
             await message.answer("🔑 کد هدیه را وارد کن:")
             return
@@ -1780,7 +1959,7 @@ async def handle_text(message: Message):
             if not create_gift(code, pending[1]):
                 await message.answer("⚠️ این کد هدیه قبلاً ثبت شده است؛ یک کد دیگر انتخاب کن."); return
             pending_admin.pop(message.from_user.id, None)
-            await message.answer(f"✅ کد هدیه {code} با هدیه {pending[1]} 🪙 سکه ثبت شد.")
+            await message.answer(f"✅ کد هدیه {code} با هدیه {pending[1]} 💎 آریور ثبت شد.")
             return
         if message.from_user.id in pending_link:
             state = pending_link[message.from_user.id]
@@ -1847,6 +2026,50 @@ async def handle_text(message: Message):
                 return
         return
 
+    # User commands work in private and group chats.
+    if text in ("منو","menu"):
+        await message.answer(profile_text(message.from_user.id),reply_markup=user_menu_keyboard()); return
+    if text in ("راهنما","راهنمای الناز"):
+        await message.answer(user_help_text(),reply_markup=user_menu_keyboard()); return
+    m=re.fullmatch(r"ترید\s+(100|1000|10000)",text)
+    if m:
+        amount=int(m.group(1)); net,r,status=do_trade(message.from_user.id,amount)
+        if status=="funds": await message.reply("❌ موجودی آریورت برای این ترید کافی نیست. 💰"); return
+        result=f"🟢 {format_coins(net)} آریور سود کردی! 📈" if net>0 else f"🔴 {format_coins(abs(net))} آریور ضرر کردی. 📉"
+        await message.reply(f"🎲 ترید {format_coins(amount)} آریور انجام شد!\n\n{result}\n💰 موجودی جدید: {format_coins(r['balance'])} آریور"); return
+    if text=="ارتقای لول":
+        ok,r,c=upgrade_level(message.from_user.id); await message.reply(f"🎉 لول ارتقا یافت! ⭐\n💸 {format_coins(c)} آریور کسر شد." if ok else f"❌ {format_coins(c)} آریور برای ارتقا لازم داری. 💰"); return
+    if text in ("ارتقای لول شانس","ارتقای لول تجربه"):
+        stat="luck_level" if "شانس" in text else "exp_level"; ok,r,c,why=upgrade_stat(message.from_user.id,stat)
+        if ok: await message.reply(f"🎉 ارتقای {'🍀 شانس' if stat=='luck_level' else '🧠 تجربه'} انجام شد!\n💸 {format_coins(c)} آریور کسر شد.")
+        elif why=="max": await message.reply("🏆 این لول به 10 رسیده است.")
+        else: await message.reply(f"❌ {format_coins(c)} آریور برای این ارتقا لازم داری. 💰")
+        return
+    direct_transfer=re.fullmatch(r"انتقال\s+([0-9,]+)",text)
+    if direct_transfer and message.reply_to_message:
+        try: amount=int(direct_transfer.group(1).replace(",","")); assert amount>0
+        except Exception: await message.reply("❌ مقدار انتقال باید عدد مثبت باشد. 💸"); return
+        target=message.reply_to_message.from_user
+        if not target or target.id==message.from_user.id: await message.reply("❌ انتقال به خودت ممکن نیست. 🙅"); return
+        if get_balance(message.from_user.id)<amount: await message.reply("❌ موجودی آریور کافی نیست. 💰"); return
+        transfer_pending[message.from_user.id]=("confirm",amount,target.id,target.username or "")
+        label='@'+target.username if target.username else f'کاربر {target.id}'
+        await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(amount)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
+
+    if message.from_user.id in transfer_pending:
+        state=transfer_pending[message.from_user.id]
+        if state=="amount":
+            try: amount=int(text.replace(",","")); assert amount>0
+            except Exception: await message.reply("❌ مقدار انتقال باید عدد مثبت باشد. 💸"); return
+            transfer_pending[message.from_user.id]=amount; await message.reply("👤 حالا روی پیام فرد موردنظر ریپلای کن. 💸"); return
+        if isinstance(state,int) and message.reply_to_message:
+            target=message.reply_to_message.from_user
+            if not target or target.id==message.from_user.id: await message.reply("❌ انتقال به خودت ممکن نیست. 🙅"); return
+            if get_balance(message.from_user.id)<state: await message.reply("❌ موجودی آریور کافی نیست. 💰"); transfer_pending.pop(message.from_user.id,None); return
+            transfer_pending[message.from_user.id]=("confirm",state,target.id,target.username or "")
+            label='@'+target.username if target.username else f'کاربر {target.id}'
+            await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(state)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
+
     if message.chat.type in ("group", "supergroup"):
         normalized = text.replace("‌", "").strip().lower()
         if "آرسین" in text or "ارسین" in text:
@@ -1860,7 +2083,7 @@ async def handle_text(message: Message):
                 "📚 راهنمای الناز 🤖✨\n\n"
                 "🎭 بازی مافیا: با «بازی مافیا» بازی را شروع کن.\n"
                 "🛑 پایان بازی: «پایان بازی» یا «بایان بازی»\n"
-                "🪙 سکه: «عاح» برای دریافت سکه با cooldown پنج‌دقیقه‌ای\n"
+                "💎 آریور: «عاح» برای دریافت آریور با cooldown پنج‌دقیقه‌ای\n"
                 "💰 موجودی: «موجودی»\n"
                 "🎁 کد هدیه: «کد هدیه CODE»\n"
                 "👤 برای ورود به بازی، اول ربات را در خصوصی /start کن و در هر دو لینک عضویت کن.\n\n"
@@ -1869,18 +2092,14 @@ async def handle_text(message: Message):
             )
             return
         if text == "عاح":
-            last = coin_cooldown(message.from_user.id)
-            remaining = COIN_COOLDOWN - int(time.time() - last)
-            if remaining > 0:
-                mins, secs = divmod(remaining, 60)
-                await message.reply(f"⏳ تو تازه عاح عاح کردی! 😄\n🕐 هنوز {mins} دقیقه و {secs} ثانیه تا 5 دقیقه تموم شه مونده.\n🪙 بعدش دوباره میتونی عاح عاح کنی.")
+            last=coin_cooldown(message.from_user.id); remaining=COIN_COOLDOWN-int(time.time()-last)
+            if remaining>0:
+                mins,secs=divmod(remaining,60); await message.reply(f"⏳ تازه عاح عاح کردی! 😄\n🕐 {mins} دقیقه و {secs} ثانیه مونده.\n💎 بعدش دوباره میتونی عاح عاح کنی.")
             else:
-                set_coin_time(message.from_user.id, int(time.time()))
-                balance = add_coins(message.from_user.id, COIN_REWARD)
-                await message.reply(f"🪙 از عاح قلیضت خیلی خوشم اومد واسه همین {format_coins(COIN_REWARD)} سکه بهت میدم 😍\n💰 موجودی سکه‌ها: {format_coins(balance)} 🪙\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی 💖")
+                r=process_ah(message.from_user.id); extra=f"\n🎉 لول ارتقا یافت و {format_coins(r['level_reward'])} آریور جایزه گرفتی! ⭐" if r["leveled_up"] else ""
+                await message.reply(f"💎 از عاح قلیضت خیلی خوشم اومد! واسه همین {format_coins(r['reward'])} آریور بهت میدم 😍\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n⭐ لول کاربر: {r['level']}\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی 💖{extra}")
             return
-        if text == "موجودی":
-            await message.reply(f"💰 موجودی سکه‌های شما: {format_coins(get_balance(message.from_user.id))} 🪙"); return
+        if text == "موجودی": await message.reply(f"💰 موجودی آریور شما: {format_coins(get_balance(message.from_user.id))} آریور 💎"); return
         if text.startswith("کد هدیه "):
             code = text[len("کد هدیه "):].strip()
             amount, status = redeem_gift(code, message.from_user.id)
@@ -1888,7 +2107,7 @@ async def handle_text(message: Message):
                 await message.reply("❌ این کد هدیه وجود ندارد یا منقضی شده است."); return
             if status == "used":
                 await message.reply("⚠️ شما قبلاً از این کد هدیه استفاده کرده‌اید."); return
-            await message.reply(f"🎉 کد هدیه فعال شد!\n🪙 {format_coins(amount)} سکه به موجودی شما اضافه شد.\n💰 موجودی شما: {format_coins(get_balance(message.from_user.id))} 🪙")
+            await message.reply(f"🎉 کد هدیه فعال شد!\n💎 {format_coins(amount)} آریور به موجودی شما اضافه شد.\n💰 موجودی شما: {format_coins(get_balance(message.from_user.id))} 💎")
             return
         if text in ("بازی مافیا", "بازی مافیا 🎭"):
             await start_game_setup(message); return
@@ -1903,6 +2122,22 @@ async def handle_text(message: Message):
     # AI is disabled: do not reply to ordinary messages.
     return
 
+
+@dp.callback_query(F.data.startswith("transfer:"))
+async def transfer_callback(query:CallbackQuery):
+    parts=query.data.split(":"); sender=int(parts[2]); action=parts[1]
+    if query.from_user.id!=sender: await query.answer("❌ فقط فرستنده می‌تواند تأیید کند.",show_alert=True); return
+    pending=transfer_pending.get(sender)
+    if not isinstance(pending,tuple): await query.answer("⚠️ انتقال دیگر فعال نیست.",show_alert=True); return
+    if action=="cancel": transfer_pending.pop(sender,None); await query.message.edit_text("❌ انتقال لغو شد."); await query.answer(); return
+    amount,target_id,username=pending[1:]
+    if get_balance(sender)<amount: transfer_pending.pop(sender,None); await query.message.edit_text("❌ موجودی آریور کافی نیست. 💰"); await query.answer(); return
+    add_coins(sender,-amount); add_coins(target_id,amount); transfer_pending.pop(sender,None)
+    target_label='@'+username if username else f'کاربر {target_id}'
+    await query.message.edit_text(f"✅ انتقال انجام شد! 💸\n\n💰 {format_coins(amount)} آریور به {target_label} منتقل شد.\n💳 موجودی شما: {format_coins(get_balance(sender))} آریور")
+    try: await bot.send_message(target_id,f"🎁 {format_coins(amount)} آریور برای شما انتقال داده شد. 💸\n💰 موجودی: {format_coins(get_balance(target_id))} آریور")
+    except Exception: pass
+    await query.answer("💸 انجام شد!")
 
 # ================================================================
 # MAIN
