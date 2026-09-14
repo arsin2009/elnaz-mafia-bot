@@ -503,6 +503,24 @@ BLACK_SHOP_ITEMS = {
     if k in COMBAT_POWER and COMBAT_POWER[k] > 0
 }
 
+# 🕶️ تجهیزات اختصاصی «شوشول بری»
+# مجموع ابزارهای هجومی دقیقاً +30٪ به شانس پایه 50٪ اضافه می‌کنند؛ سقف موفقیت 80٪ است.
+SHOSHUL_TOOLS = {
+    "🔪 چاقوی دول‌بری": (12000, 8, "ابزار شوشول بری؛ +8٪ شانس موفقیت"),
+    "✂️ قیچی": (14000, 8, "ابزار شوشول بری؛ +8٪ شانس موفقیت"),
+    "🪚 اره‌برقی": (18000, 7, "ابزار شوشول بری؛ +7٪ شانس موفقیت"),
+    "🔪 دول‌بُر": (22000, 7, "ابزار شوشول بری؛ +7٪ شانس موفقیت"),
+}
+
+# 🛡️ ضد شوشول بر: روی شانس نهایی مهاجم اثر منفی می‌گذارند.
+SHOSHUL_DEFENSES = {
+    "🛡️ شوشول طلایی": (30000, 15, "ضد شوشول بر؛ 15٪ از شانس برد مهاجم کم می‌کند"),
+    "💘 معشوق شوشول": (22000, 10, "ضد شوشول بر؛ 10٪ از شانس برد مهاجم کم می‌کند"),
+}
+
+for _name, (_base_cost, _bonus, _desc) in {**SHOSHUL_TOOLS, **SHOSHUL_DEFENSES}.items():
+    BLACK_SHOP_ITEMS[_name] = (_base_cost * 10, _desc)
+
 def black_shop_buy(uid, item):
     if item not in BLACK_SHOP_ITEMS:
         return False, "missing", 0
@@ -609,14 +627,30 @@ def remove_item(uid,item,qty=1):
         c.execute("UPDATE inventory SET quantity=quantity-? WHERE user_id=? AND item=?",(qty,uid,item)); c.execute("DELETE FROM inventory WHERE user_id=? AND item=? AND quantity<=0",(uid,item)); c.commit()
     return True
 
+def item_effect_description(item, qty=1):
+    if item in SHOSHUL_TOOLS:
+        _cost, bonus, desc = SHOSHUL_TOOLS[item]
+        return f"🎯 {desc}"
+    if item in SHOSHUL_DEFENSES:
+        _cost, reduction, desc = SHOSHUL_DEFENSES[item]
+        return f"🛡️ {desc}"
+    if item == "⚡ Boost XP": return "🧠 با خرید/استفاده، ۵۰۰ XP اضافه می‌کند"
+    if item == "🍀 شانس ویژه": return "🍀 در مبارزه یک‌بار +10٪ شانس می‌دهد و سپس مصرف می‌شود"
+    if item == "🛡️ سپر انرژی": return "🛡️ یک شکست در مبارزه را خنثی می‌کند و سپس مصرف می‌شود"
+    if item == "🎟️ بلیت بازی": return "🎮 آیتم اقتصادی و قابل معامله در بازار"
+    if item == "👑 عنوان VIP": return "🏷️ آیتم تزئینی برای عنوان VIP"
+    if item in COMBAT_POWER and COMBAT_POWER[item] > 0:
+        return f"⚔️ +{COMBAT_POWER[item]} قدرت مبارزه برای هر عدد"
+    return "🎒 آیتم کاربردی"
+
 def inventory_text(uid):
     with db() as c: rows=c.execute("SELECT item,quantity FROM inventory WHERE user_id=? AND quantity>0 ORDER BY item",(uid,)).fetchall()
     if not rows: return "🎒 کوله‌پشتی شما خالی است.\n\n🛍️ از فروشگاه آیتم یا فروشگاه سیاه خرید کن."
     lines=[]
     for item,qty in rows:
         power=COMBAT_POWER.get(item,0)
-        suffix=f" — ⚔️ +{power*min(int(qty),10)} قدرت" if power else " — 🎒 کاربردی"
-        lines.append(f"{item} × {qty}{suffix}")
+        power_suffix=f" | ⚔️ قدرت کل: +{power*min(int(qty),10)}" if power else ""
+        lines.append(f"{item} × {qty}{power_suffix}\n   ↳ {item_effect_description(item, qty)}")
     return "🎒 کوله‌پشتی و تجهیزات شما\n\n"+"\n".join(lines)+f"\n\n⚔️ قدرت کل مبارزه: {combat_power(uid)}"
 
 def shop_v2_buy(uid,item):
@@ -2465,12 +2499,34 @@ def dooz_winner(board):
 # ================================================================
 # USER MENU / ECONOMY
 # ================================================================
+def displayed_username(uid):
+    # منو باید برای همه کاربران مشخص کند متعلق به چه کسی است.
+    # در صورت داشتن username، همان @username نمایش داده می‌شود؛
+    # اگر username وجود نداشته باشد، نام نمایشی کاربر نشان داده می‌شود.
+    row = get_user_record(uid)
+    if row:
+        username = (row[1] or "").strip()
+        full_name = (row[2] or "").strip()
+        if username:
+            return "@" + username.lstrip("@")
+        if full_name:
+            return full_name
+    return "بازیکن"
+
+def total_balance(uid):
+    return get_balance(uid) + bank_balance(uid)
+
+def balance_display(uid):
+    return (f"💰 موجودی کل: {format_coins(total_balance(uid))} آریور\n"
+            f"👛 کیف پول: {format_coins(get_balance(uid))} آریور\n"
+            f"🏦 بانک: {format_coins(bank_balance(uid))} آریور")
+
 def profile_text(uid):
     r=get_coin_row(uid); win=min(80,r["luck_level"]*4+r["exp_level"]*4)
     title=current_title(uid) or "بدون عنوان"
     st=get_daily_state(uid)
-    display=display_name_by_id(uid)
-    return (f"👤 منوی کاربر الناز ✨\n\n🪪 این منو متعلق به: {display}\n\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n🏦 بانک: {format_coins(bank_balance(uid))} آریور\n🏷️ عنوان: {title}\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}\n🔥 استریک روزانه: {st['streak']}\n⚔️ قدرت تجهیزات: {combat_power(uid)}")
+    display=displayed_username(uid)
+    return (f"👤 منوی کاربر الناز ✨\n\n🪪 این منو متعلق به کاربر: {display}\n\n{balance_display(uid)}\n🏷️ عنوان: {title}\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}\n🔥 استریک روزانه: {st['streak']}\n⚔️ قدرت تجهیزات: {combat_power(uid)}")
 
 def user_menu_keyboard():
     return keyboard([
@@ -2495,7 +2551,8 @@ def help_categories_keyboard():
         [button("💰 آریور و پروفایل", "help:cat:money"), button("🏦 بانک", "help:cat:bank")],
         [button("🎁 روزانه و ماموریت", "help:cat:daily"), button("📊 آمار و رنک", "help:cat:stats")],
         [button("🛍️ فروشگاه و آیتم‌ها", "help:cat:shop"), button("🥊 مبارزه و تجهیزات", "help:cat:combat")],
-        [button("🎮 بازی‌های شرطی", "help:cat:games"), button("🛒 بازار", "help:cat:market")],
+        [button("✂️ شوشول بری", "help:cat:shoshol"), button("🎮 بازی‌های شرطی", "help:cat:games")],
+        [button("🛒 بازار", "help:cat:market")],
         [button("🏆 تورنمنت و قهرمان", "help:cat:tournament"), button("🎭 مافیا", "help:cat:mafia")],
         [button("🎁 کد هدیه و عضویت", "help:cat:general")],
         [button("🔙 برگشت به منو", "user:menu")],
@@ -2543,7 +2600,10 @@ HELP_CATEGORY_TEXTS = {
         "• «خرید عنوان شماره» → خرید عنوان؛ مثال: «خرید عنوان 2»\n"
         "• «عنوان‌های من» → عنوان‌های خریداری‌شده 🏷️\n"
         "• «عنوان شماره» → فعال کردن عنوان؛ مثال: «عنوان 1»\n"
-        "• «آیتم‌ها» → تمام آیتم‌های شما، تعداد و قدرت تجهیزات 🎒\n"    ),
+        "• «آیتم‌ها» → تمام آیتم‌های شما، تعداد و قدرت تجهیزات 🎒\n"
+        "• داخل کوله‌پشتی کارایی هر آیتم هم دقیقاً نوشته می‌شود. ℹ️\n"
+        "• ابزارهای شوشول بری و آیتم‌های ضدشوشول در فروشگاه سیاه هستند. 🕶️\n"
+    ),
     "combat": (
         "🥊 راهنمای مبارزه و تجهیزات\n\n"
         "• «فروشگاه سیاه» → تجهیزات مبارزه و شخصیت‌های خیالی ⚔️\n"
@@ -2553,7 +2613,36 @@ HELP_CATEGORY_TEXTS = {
         "• قدرت تجهیزات روی شانس برد اثر دارد. ⚔️\n"
         "• 🛡️ سپر انرژی می‌تواند یک شکست را خنثی کند و مصرف می‌شود.\n"
         "• 🍀 شانس ویژه یک‌بار +۱۰٪ شانس مبارزه می‌دهد و مصرف می‌شود.\n"
-        "• اگر تا ۶۰ ثانیه کسی وارد نشود، مبلغ سازنده برمی‌گردد. ⏳"
+        "• اگر تا ۶۰ ثانیه کسی وارد نشود، مبلغ سازنده برمی‌گردد. ⏳\n"
+        "\n✂️ شوشول بری\n"
+        "• «شوشول بری» را با ریپلای روی کاربر اجرا کن. 😈\n"
+        "• هدف باید حداقل 500 آریور در کیف پول عادی داشته باشد؛ بانک قابل دزدی نیست. 🏦🚫\n"
+        "• شانس پایه 50٪ است و ابزارها حداکثر +30٪ می‌دهند؛ سقف موفقیت 80٪ است. 🎯\n"
+        "• چاقوی دول‌بری +8٪، قیچی +8٪، اره‌برقی +7٪ و دول‌بُر +7٪ می‌دهند. 🧰\n"
+        "• شوشول طلایی 15٪ و معشوق شوشول 10٪ از شانس مهاجم کم می‌کنند. 🛡️\n"
+        "• سود یا جریمه تصادفی بین 0 تا یک‌سی‌ام موجودی کیف پول هدف است. 💎\n"
+        "• اگر جریمه از کیف پول مهاجم بیشتر باشد، فقط کل موجودی کیف پول او کسر می‌شود.\n"
+    ),
+    "shoshol": (
+        "✂️ راهنمای کامل شوشول بری 😈\n\n"
+        "📌 دستور: روی پیام کاربر موردنظر ریپلای کن و بنویس «شوشول بری».\n\n"
+        "💰 شرط هدف: کاربر باید حداقل 500 آریور در کیف پول عادی داشته باشد.\n"
+        "🏦 موجودی بانک هدف قابل دزدی نیست و هیچ اثری در شوشول بری ندارد.\n"
+        "🎯 شانس پایه موفقیت: 50٪\n"
+        "🔪 چاقوی دول‌بری: +8٪\n"
+        "✂️ قیچی: +8٪\n"
+        "🪚 اره‌برقی: +7٪\n"
+        "🔪 دول‌بُر: +7٪\n"
+        "📈 مجموع ابزارهای هجومی حداکثر +30٪ و سقف شانس نهایی 80٪ است.\n\n"
+        "🛡️ شوشول طلایی: 15٪ از شانس مهاجم کم می‌کند.\n"
+        "💘 معشوق شوشول: 10٪ از شانس مهاجم کم می‌کند.\n"
+        "🛡️ مجموع کاهش دفاعی حداکثر 25٪ است.\n\n"
+        "💎 در صورت موفقیت، مقدار تصادفی از 0 تا یک‌سی‌ام موجودی کیف پول هدف منتقل می‌شود.\n"
+        "🚨 در صورت شکست، مقدار تصادفی به‌عنوان جریمه از کیف پول مهاجم کم می‌شود.\n"
+        "⚠️ اگر جریمه بیشتر از موجودی کیف پول مهاجم باشد، فقط کل کیف پول او کسر می‌شود.\n"
+        "🔒 بانک هیچ‌کدام از طرفین در این عملیات دست‌کاری نمی‌شود.\n\n"
+        "🎒 برای دیدن تعداد و اثر ابزارها: «آیتم‌ها» را بزن.\n"
+        "🕶️ خرید ابزارها: «فروشگاه سیاه»\n"
     ),
     "games": (
         "🎮 راهنمای بازی‌های شرطی دو نفره\n\n"
@@ -3092,7 +3181,7 @@ async def trade_callback(query:CallbackQuery):
     amount=int(query.data.split(":",1)[1]); net,r,status=do_trade(query.from_user.id,amount)
     if status=="funds": await query.answer("❌ موجودی آریورت کافی نیست.",show_alert=True); return
     result=f"🟢 {format_coins(net)} آریور سود کردی! 📈" if net>0 else f"🔴 {format_coins(abs(net))} آریور ضرر کردی. 📉"
-    await query.message.edit_text(f"🎲 نتیجه ترید {format_coins(amount)} آریور\n\n{result}\n💰 موجودی جدید: {format_coins(r['balance'])} آریور",reply_markup=user_menu_keyboard()); await query.answer("🎲 ترید انجام شد!")
+    await query.message.edit_text(f"🎲 نتیجه ترید {format_coins(amount)} آریور\n\n{result}\n{balance_display(query.from_user.id)}",reply_markup=user_menu_keyboard()); await query.answer("🎲 ترید انجام شد!")
 
 @dp.callback_query(F.data=="user:help")
 async def user_help(query:CallbackQuery):
@@ -3188,6 +3277,96 @@ async def callback_link(query: CallbackQuery):
         f"🔗 لینک {slot} را ارسال کن.\n\nمثال: https://t.me/channel یا https://t.me/+InviteLink\n\nبعد از آن اطلاعات لازم را خودکار بررسی می‌کنم. 🤖",
     )
 
+
+# ================================================================
+# SHOSHUL BARI — RISK / TOOLS / DEFENSE
+# ================================================================
+def shoshol_tool_bonus(uid):
+    bonus=0
+    owned=[]
+    for item, (_cost, pct, _desc) in SHOSHUL_TOOLS.items():
+        if inventory_qty(uid,item)>0:
+            bonus += pct
+            owned.append((item,pct))
+    return min(30, bonus), owned
+
+def shoshol_defense_reduction(uid):
+    reduction=0
+    owned=[]
+    for item, (_cost, pct, _desc) in SHOSHUL_DEFENSES.items():
+        if inventory_qty(uid,item)>0:
+            reduction += pct
+            owned.append((item,pct))
+    return min(25, reduction), owned
+
+def shoshol_chance(thief_id, target_id):
+    tool_bonus, tools = shoshol_tool_bonus(thief_id)
+    defense_reduction, defenses = shoshol_defense_reduction(target_id)
+    chance=max(0, min(80, 50 + tool_bonus - defense_reduction))
+    return chance, tool_bonus, defense_reduction, tools, defenses
+
+def shoshol_max_amount(target_id):
+    # فقط کیف پول عادی هدف قابل دزدی است؛ بانک هرگز درگیر نمی‌شود.
+    return get_balance(target_id)//30
+
+async def handle_shoshol_bari(message):
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply("❌ شوشول بری فقط داخل گروه انجام می‌شود. 👥")
+        return True
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        await message.reply("❌ برای شوشول بری باید روی پیام کاربر موردنظر ریپلای کنی. ↩️")
+        return True
+    thief=message.from_user.id
+    target=message.reply_to_message.from_user
+    if target.id==thief:
+        await message.reply("❌ نمی‌تونی شوشول خودت رو ببری! 😂")
+        return True
+    target_balance=get_balance(target.id)
+    if target_balance < 500:
+        await message.reply(f"❌ موجودی کیف پول این کاربر حداقل باید 500 آریور باشد.\n💰 موجودی قابل هدف: {format_coins(target_balance)} آریور\n🏦 موجودی بانک در شوشول بری حساب نمی‌شود.")
+        return True
+
+    chance, tool_bonus, defense_reduction, tools, defenses = shoshol_chance(thief,target.id)
+    max_amount=target_balance//30
+    amount=random.randint(0,max_amount)
+    success=random.random() < chance/100.0
+    thief_label=display_name_by_id(thief)
+    target_label=display_name_by_id(target.id)
+
+    if success:
+        if amount>0:
+            add_coins(target.id,-amount)
+            add_coins(thief,amount)
+            log_tx(target.id,"shoshol_bari_loss",-amount,f"by={thief}")
+            log_tx(thief,"shoshol_bari_profit",amount,f"from={target.id}")
+        tool_text=f"+{tool_bonus}% از ابزارها" if tool_bonus else "بدون ابزار اضافی"
+        defense_text=f"-{defense_reduction}% از ضدشوشول‌ها" if defense_reduction else "بدون دفاع ضدشوشول"
+        await message.reply(
+            f"🕶️✂️ شوشول بری با موفقیت انجام شد! 😈\n\n"
+            f"👤 هدف: {target_label}\n"
+            f"🎯 شانس نهایی موفقیت: {chance}%\n"
+            f"🧰 {tool_text} | 🛡️ {defense_text}\n\n"
+            f"💎 سود شما: {format_coins(amount)} آریور\n"
+            f"💰 موجودی کیف پول شما: {format_coins(get_balance(thief))} آریور\n"
+            f"🏦 بانک شما: {format_coins(bank_balance(thief))} آریور")
+    else:
+        penalty=amount
+        current=get_balance(thief)
+        actual_penalty=min(current, penalty)
+        if actual_penalty>0:
+            add_coins(thief,-actual_penalty)
+            log_tx(thief,"shoshol_bari_penalty",-actual_penalty,f"target={target.id};requested={penalty}")
+        tool_text=f"+{tool_bonus}% از ابزارها" if tool_bonus else "بدون ابزار اضافی"
+        defense_text=f"-{defense_reduction}% از ضدشوشول‌ها" if defense_reduction else "بدون دفاع ضدشوشول"
+        await message.reply(
+            f"🚨 شوشول بری لو رفت! 😵‍💫\n\n"
+            f"👤 هدف: {target_label}\n"
+            f"🎯 شانس موفقیت شما: {chance}%\n"
+            f"🧰 {tool_text} | 🛡️ {defense_text}\n\n"
+            f"💸 جریمه شما: {format_coins(actual_penalty)} آریور\n"
+            f"💰 موجودی کیف پول شما: {format_coins(get_balance(thief))} آریور\n"
+            f"🏦 بانک شما: {format_coins(bank_balance(thief))} آریور")
+    return True
 
 # ================================================================
 # COMBAT / BLACK SHOP
@@ -3554,7 +3733,7 @@ async def handle_text(message: Message):
         if status=="amount": await message.reply("❌ مبلغ ترید باید بیشتر از صفر باشد. 🎲💎"); return
         if status=="funds": await message.reply("❌ موجودی آریورت برای این ترید کافی نیست. 💰"); return
         result=f"🟢 {format_coins(net)} آریور سود کردی! 📈" if net>0 else f"🔴 {format_coins(abs(net))} آریور ضرر کردی. 📉"
-        await message.reply(f"🎲 ترید {format_coins(amount)} آریور انجام شد!\n\n{result}\n💰 موجودی جدید: {format_coins(r['balance'])} آریور"); return
+        await message.reply(f"🎲 ترید {format_coins(amount)} آریور انجام شد!\n\n{result}\n{balance_display(message.from_user.id)}"); return
     if text=="ارتقای لول":
         ok,r,c=upgrade_level(message.from_user.id); await message.reply(f"🎉 لول ارتقا یافت! ⭐\n💸 {format_coins(c)} آریور کسر شد." if ok else f"❌ {format_coins(c)} آریور برای ارتقا لازم داری. 💰"); return
     if text in ("ارتقای لول شانس","ارتقای لول تجربه"):
@@ -3679,6 +3858,10 @@ async def handle_text(message: Message):
                 asyncio.create_task(wager_expiry_task(wid))
                 return
 
+    if text in ("شوشول بری", "شوشول‌بری", "شوشول بري"):
+        await handle_shoshol_bari(message)
+        return
+
     # Safe in-game mini-games using Arioor only.
     if text.startswith("شیر یا خط"):
         parts=text.split()
@@ -3713,9 +3896,9 @@ async def handle_text(message: Message):
                 mins,secs=divmod(remaining,60); await message.reply(f"⏳ تازه عاح عاح کردی! 😄\n🕐 {mins} دقیقه و {secs} ثانیه مونده.\n💎 بعدش دوباره میتونی عاح عاح کنی.")
             else:
                 r=process_ah(message.from_user.id); extra=f"\n🎉 لول ارتقا یافت و {format_coins(r['level_reward'])} آریور جایزه گرفتی! ⭐" if r["leveled_up"] else ""
-                await message.reply(f"💎 از عاح قلیضت خیلی خوشم اومد! واسه همین {format_coins(r['reward'])} آریور بهت میدم 😍\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n⭐ لول کاربر: {r['level']}\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی 💖{extra}")
+                await message.reply(f"💎 از عاح قلیضت خیلی خوشم اومد! واسه همین {format_coins(r['reward'])} آریور بهت میدم 😍\n{balance_display(message.from_user.id)}\n⭐ لول کاربر: {r['level']}\n⏰ 5 دقیقه دیگه دوباره میتونی عاح عاح کنی 💖{extra}")
             return
-        if text == "موجودی": await message.reply(f"💰 موجودی آریور شما: {format_coins(get_balance(message.from_user.id))} آریور 💎"); return
+        if text == "موجودی": await message.reply(f"{balance_display(message.from_user.id)}"); return
         if text.startswith("کد هدیه "):
             code = text[len("کد هدیه "):].strip()
             amount, status = redeem_gift(code, message.from_user.id)
