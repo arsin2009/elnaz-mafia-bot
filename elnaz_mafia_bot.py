@@ -133,6 +133,13 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS user_title(user_id INTEGER PRIMARY KEY, title TEXT DEFAULT '')")
         c.execute("CREATE TABLE IF NOT EXISTS market(listing_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, amount INTEGER NOT NULL, price INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS wager_games(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL DEFAULT 0, game_type TEXT NOT NULL, creator_id INTEGER NOT NULL, stake INTEGER NOT NULL, opponent_id INTEGER DEFAULT 0, status TEXT NOT NULL, created_at INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS player_stats(user_id INTEGER PRIMARY KEY, games INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, draws INTEGER DEFAULT 0, points INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, best_win INTEGER DEFAULT 0, win_streak INTEGER DEFAULT 0, best_streak INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS achievements(user_id INTEGER NOT NULL, code TEXT NOT NULL, unlocked_at INTEGER DEFAULT 0, PRIMARY KEY(user_id,code))")
+        c.execute("CREATE TABLE IF NOT EXISTS inventory(user_id INTEGER NOT NULL, item TEXT NOT NULL, quantity INTEGER DEFAULT 0, PRIMARY KEY(user_id,item))")
+        c.execute("CREATE TABLE IF NOT EXISTS item_market(listing_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, item TEXT NOT NULL, quantity INTEGER NOT NULL, price INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS tournaments(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER DEFAULT 0, creator_id INTEGER NOT NULL, stake INTEGER NOT NULL, prize INTEGER DEFAULT 0, status TEXT NOT NULL, created_at INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS tournament_players(tournament_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joined_at INTEGER DEFAULT 0, PRIMARY KEY(tournament_id,user_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS tournament_rounds(tournament_id INTEGER NOT NULL, round_no INTEGER NOT NULL, player_a INTEGER NOT NULL, player_b INTEGER NOT NULL, winner_id INTEGER DEFAULT 0, PRIMARY KEY(tournament_id,round_no,player_a,player_b))")
         c.execute("CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, balance_after INTEGER NOT NULL, note TEXT DEFAULT '', created_at INTEGER DEFAULT 0)")
         c.commit()
 
@@ -430,6 +437,217 @@ def buy_market_listing(buyer_id,listing_id):
 
 
 # ================================================================
+# STAGES 1-5: GAME PROGRESSION / STATS / RANKS / ITEMS / TOURNAMENTS
+# ================================================================
+ACHIEVEMENT_DEFS = {
+    "first_game": ("🎮 اولین بازی", "اولین بازی شرطی خودت را تمام کن", 1),
+    "first_win": ("🏆 اولین برد", "اولین بردت را ثبت کن", 1),
+    "wins_10": ("🔥 ۱۰ برد", "۱۰ بازی را ببر", 10),
+    "wins_50": ("💎 ۵۰ برد", "۵۰ بازی را ببر", 50),
+    "games_100": ("🎮 ۱۰۰ بازی", "۱۰۰ بازی را کامل کن", 100),
+    "streak_5": ("🔥 استریک ۵", "۵ برد پیاپی بگیر", 5),
+    "streak_10": ("👑 استریک ۱۰", "۱۰ برد پیاپی بگیر", 10),
+    "rich_100k": ("💰 ثروتمند", "موجودی کیف پول به ۱۰۰,۰۰۰ برسد", 100000),
+}
+
+RANKS = [
+    (0, "🥉 برنز"), (100, "🥈 نقره"), (300, "🥇 طلا"),
+    (700, "💎 الماس"), (1500, "👑 استاد"), (3000, "🔥 افسانه"),
+]
+
+SHOP_ITEMS_V2 = {
+    "🛡️ سپر": (2500, "یک بار از یک باخت بازی شرطی جلوگیری می‌کند"),
+    "🍀 شانس ویژه": (3000, "یک بار شانس برد ترید را ۲۰٪ بیشتر می‌کند"),
+    "🎟️ بلیت بازی": (1500, "یک بلیت برای ورود نمایشی به سیستم بازی"),
+    "👑 عنوان VIP": (12000, "عنوان تزئینی VIP"),
+    "⚡ Boost XP": (4000, "یک بسته ۵۰۰ XP برای پیشرفت بازیکن"),
+}
+
+def ensure_player_stats(uid):
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO player_stats(user_id) VALUES(?)", (uid,))
+        c.commit()
+
+def player_stats(uid):
+    ensure_player_stats(uid)
+    with db() as c:
+        r=c.execute("SELECT games,wins,losses,draws,points,xp,best_win,win_streak,best_streak FROM player_stats WHERE user_id=?",(uid,)).fetchone()
+    return {"games":r[0],"wins":r[1],"losses":r[2],"draws":r[3],"points":r[4],"xp":r[5],"best_win":r[6],"win_streak":r[7],"best_streak":r[8]}
+
+def player_rank(uid):
+    st=player_stats(uid); points=st["points"]
+    rank=RANKS[0][1]
+    for threshold,name in RANKS:
+        if points>=threshold: rank=name
+    return rank,points
+
+def record_game(uid, result, reward=0, game_type="game"):
+    ensure_player_stats(uid)
+    with db() as c:
+        row=c.execute("SELECT games,wins,losses,draws,points,xp,best_win,win_streak,best_streak FROM player_stats WHERE user_id=?",(uid,)).fetchone()
+        games,wins,losses,draws,points,xp,best,streak,best_streak=row
+        games += 1
+        if result=="win":
+            wins+=1; streak+=1; points+=25; xp+=50; best=max(best,int(reward)); best_streak=max(best_streak,streak)
+        elif result=="loss":
+            losses+=1; streak=0; points=max(0,points-10); xp+=10
+        else:
+            draws+=1; streak=0; points+=5; xp+=20
+        c.execute("UPDATE player_stats SET games=?,wins=?,losses=?,draws=?,points=?,xp=?,best_win=?,win_streak=?,best_streak=?,updated_at=? WHERE user_id=?",(games,wins,losses,draws,points,xp,best,streak,best_streak,int(time.time()),uid)); c.commit()
+    check_achievements(uid)
+
+def achievements_list(uid):
+    with db() as c:
+        return [r[0] for r in c.execute("SELECT code FROM achievements WHERE user_id=? ORDER BY unlocked_at",(uid,)).fetchall()]
+
+def unlock_achievement(uid, code):
+    with db() as c:
+        cur=c.execute("INSERT OR IGNORE INTO achievements(user_id,code,unlocked_at) VALUES(?,?,?)",(uid,code,int(time.time())))
+        changed=cur.rowcount>0; c.commit()
+    return changed
+
+def check_achievements(uid):
+    st=player_stats(uid); checks=[]
+    if st["games"]>=1: checks.append("first_game")
+    if st["wins"]>=1: checks.append("first_win")
+    if st["wins"]>=10: checks.append("wins_10")
+    if st["wins"]>=50: checks.append("wins_50")
+    if st["games"]>=100: checks.append("games_100")
+    if st["best_streak"]>=5: checks.append("streak_5")
+    if st["best_streak"]>=10: checks.append("streak_10")
+    if get_balance(uid)>=100000: checks.append("rich_100k")
+    for code in checks: unlock_achievement(uid,code)
+
+def inventory_qty(uid,item):
+    with db() as c:
+        r=c.execute("SELECT quantity FROM inventory WHERE user_id=? AND item=?",(uid,item)).fetchone()
+    return int(r[0]) if r else 0
+
+def add_item(uid,item,qty=1):
+    if qty<=0: return
+    with db() as c:
+        c.execute("INSERT INTO inventory(user_id,item,quantity) VALUES(?,?,?) ON CONFLICT(user_id,item) DO UPDATE SET quantity=quantity+excluded.quantity",(uid,item,qty)); c.commit()
+
+def remove_item(uid,item,qty=1):
+    if inventory_qty(uid,item)<qty: return False
+    with db() as c:
+        c.execute("UPDATE inventory SET quantity=quantity-? WHERE user_id=? AND item=?",(qty,uid,item)); c.execute("DELETE FROM inventory WHERE user_id=? AND item=? AND quantity<=0",(uid,item)); c.commit()
+    return True
+
+def inventory_text(uid):
+    with db() as c: rows=c.execute("SELECT item,quantity FROM inventory WHERE user_id=? AND quantity>0 ORDER BY item",(uid,)).fetchall()
+    if not rows: return "🎒 کوله‌پشتی شما خالی است.\n\n🛍️ از فروشگاه آیتم بخر."
+    return "🎒 کوله‌پشتی\n\n"+"\n".join(f"{item} × {qty}" for item,qty in rows)
+
+def shop_v2_buy(uid,item):
+    if item not in SHOP_ITEMS_V2: return False,"missing",0
+    cost=SHOP_ITEMS_V2[item][0]
+    if get_balance(uid)<cost: return False,"funds",cost
+    add_coins(uid,-cost); add_item(uid,item,1); log_tx(uid,"shop_item",-cost,item)
+    if item=="⚡ Boost XP":
+        with db() as c: c.execute("UPDATE player_stats SET xp=xp+500 WHERE user_id=?",(uid,)); c.commit()
+    return True,"ok",cost
+
+def create_item_listing(seller,item,qty,price):
+    if item not in SHOP_ITEMS_V2 or qty<=0 or price<=0 or inventory_qty(seller,item)<qty: return False
+    if not remove_item(seller,item,qty): return False
+    with db() as c: c.execute("INSERT INTO item_market(seller_id,item,quantity,price,active,created_at) VALUES(?,?,?, ?,1,?)",(seller,item,qty,price,int(time.time()))); c.commit()
+    log_tx(seller,"item_market_lock",0,f"{item} x{qty} price={price}")
+    return True
+
+def active_item_market(limit=10):
+    with db() as c: return c.execute("SELECT listing_id,seller_id,item,quantity,price,created_at FROM item_market WHERE active=1 ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()
+
+def buy_item_listing(buyer,lid):
+    with db() as c:
+        row=c.execute("SELECT seller_id,item,quantity,price,active FROM item_market WHERE listing_id=?",(lid,)).fetchone()
+        if not row: return False,"missing",0
+        seller,item,qty,price,active=row
+        if not active: return False,"inactive",price
+        if seller==buyer: return False,"self",price
+        if get_balance(buyer)<price: return False,"funds",price
+        c.execute("UPDATE item_market SET active=0 WHERE listing_id=? AND active=1",(lid,)); c.commit()
+    add_coins(buyer,-price); add_coins(seller,price); add_item(buyer,item,qty)
+    log_tx(buyer,"item_market_buy",-price,f"listing={lid}"); log_tx(seller,"item_market_sell",price,f"listing={lid}")
+    return True,"ok",price
+
+def streak_text(uid):
+    st=player_stats(uid); daily=get_daily_state(uid)
+    return f"🔥 استریک برد: {st['win_streak']}\n🏆 بهترین استریک: {st['best_streak']}\n📅 استریک روزانه: {daily['streak']} روز"
+
+def leaderboard_points(limit=10):
+    with db() as c:
+        return c.execute("SELECT u.id,u.username,s.points,s.wins,s.games,s.best_streak FROM users u JOIN player_stats s ON s.user_id=u.id ORDER BY s.points DESC,s.wins DESC LIMIT ?",(limit,)).fetchall()
+
+def leaderboard_wins(limit=10):
+    with db() as c:
+        return c.execute("SELECT u.id,u.username,s.wins,s.games,s.points FROM users u JOIN player_stats s ON s.user_id=u.id ORDER BY s.wins DESC,s.points DESC LIMIT ?",(limit,)).fetchall()
+
+def leaderboard_balance(limit=10):
+    return leaderboard(limit)
+
+def tournament_create(chat_id,creator_id,stake):
+    if stake<=0 or get_balance(creator_id)<stake: return None,"funds"
+    add_coins(creator_id,-stake); log_tx(creator_id,"tournament_lock",-stake,"tournament")
+    with db() as c:
+        cur=c.execute("INSERT INTO tournaments(chat_id,creator_id,stake,prize,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",(chat_id,creator_id,stake,stake,"waiting",int(time.time()),int(time.time())+120)); tid=cur.lastrowid
+        c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at) VALUES(?,?,?)",(tid,creator_id,int(time.time()))); c.commit()
+    return tid,"ok"
+
+def tournament_get(tid):
+    with db() as c:
+        r=c.execute("SELECT id,chat_id,message_id,creator_id,stake,prize,status,created_at,expires_at FROM tournaments WHERE id=?",(tid,)).fetchone()
+    if not r:return None
+    return {"id":r[0],"chat_id":r[1],"message_id":r[2],"creator_id":r[3],"stake":r[4],"prize":r[5],"status":r[6],"created_at":r[7],"expires_at":r[8]}
+
+def tournament_players(tid):
+    with db() as c:return [r[0] for r in c.execute("SELECT user_id FROM tournament_players WHERE tournament_id=? ORDER BY joined_at",(tid,)).fetchall()]
+
+def tournament_join(tid,uid):
+    t=tournament_get(tid)
+    if not t:return None,"closed"
+    if t["status"]!="waiting":return t,"closed"
+    if int(time.time())>=t["expires_at"]:return t,"expired"
+    ps=tournament_players(tid)
+    if uid in ps:return t,"self"
+    if len(ps)>=8:return t,"full"
+    if get_balance(uid)<t["stake"]:return t,"funds"
+    add_coins(uid,-t["stake"]); log_tx(uid,"tournament_lock",-t["stake"],f"tid={tid}")
+    with db() as c:
+        c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at) VALUES(?,?,?)",(tid,uid,int(time.time())))
+        c.execute("UPDATE tournaments SET prize=prize+? WHERE id=?",(t["stake"],tid)); c.commit()
+    return tournament_get(tid),"ok"
+
+def tournament_round(tid):
+    t=tournament_get(tid); ps=tournament_players(tid)
+    if not t:return None
+    if len(ps)<=1:return ("final",ps[0],t["prize"]) if ps else None
+    rnd=1
+    with db() as c:
+        r=c.execute("SELECT COALESCE(MAX(round_no),0) FROM tournament_rounds WHERE tournament_id=?",(tid,)).fetchone(); rnd=int(r[0])+1
+    random.shuffle(ps); results=[]; winners=[]
+    for i in range(0,len(ps),2):
+        a=ps[i]; b=ps[i+1]
+        w=random.choice([a,b]); l=b if w==a else a
+        winners.append(w); results.append((a,b,w,l))
+        with db() as c:c.execute("INSERT INTO tournament_rounds(tournament_id,round_no,player_a,player_b,winner_id) VALUES(?,?,?,?,?)",(tid,rnd,a,b,w)); c.commit()
+    if len(winners)==1:
+        with db() as c:c.execute("UPDATE tournaments SET status='finished' WHERE id=?",(tid,)); c.commit()
+        add_coins(winners[0],t["prize"]); log_tx(winners[0],"tournament_win",t["prize"],f"tid={tid}")
+        record_game(winners[0],"win",t["prize"],"tournament")
+        for u in ps:
+            if u!=winners[0]: record_game(u,"loss",0,"tournament")
+        return ("final",winners[0],t["prize"],results)
+    # Persist survivors for next round in a temporary status table by rewriting players.
+    with db() as c:
+        c.execute("DELETE FROM tournament_players WHERE tournament_id=?",(tid,))
+        for u in winners:c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at) VALUES(?,?,?)",(tid,u,int(time.time())))
+        c.commit()
+    return ("round",rnd,winners,results)
+
+TOURNAMENT_WAIT_SECONDS=120
+
+# ================================================================
 # PLAYER-vs-PLAYER WAGER GAMES
 # ================================================================
 WAGER_GAME_NAMES = {
@@ -439,6 +657,10 @@ WAGER_GAME_NAMES = {
     "evenodd": "زوج یا فرد",
     "guess": "حدس عدد",
     "higher": "بالاتر",
+    "dice": "تاس جنگ",
+    "coinflip": "شیر یا خط دو نفره",
+    "blackjack": "بلک‌جک ساده",
+    "quickmath": "مسابقه سرعت",
 }
 
 def create_wager(chat_id, creator_id, game_type, stake):
@@ -527,18 +749,21 @@ def finish_wager(wid, winner_id=None, draw=False):
     if not w or w["status"] != "active":
         return None, "closed"
     pot = w["stake"] * 2
+    game_name = WAGER_GAME_NAMES.get(w["game_type"], w["game_type"])
     if draw:
-        add_coins(w["creator_id"], w["stake"])
-        add_coins(w["opponent_id"], w["stake"])
-        log_tx(w["creator_id"], "wager_draw_refund", w["stake"], WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
-        log_tx(w["opponent_id"], "wager_draw_refund", w["stake"], WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+        add_coins(w["creator_id"], w["stake"]); add_coins(w["opponent_id"], w["stake"])
+        log_tx(w["creator_id"], "wager_draw_refund", w["stake"], game_name)
+        log_tx(w["opponent_id"], "wager_draw_refund", w["stake"], game_name)
+        record_game(w["creator_id"], "draw", w["stake"], w["game_type"])
+        record_game(w["opponent_id"], "draw", w["stake"], w["game_type"])
     else:
-        add_coins(winner_id, pot)
-        log_tx(winner_id, "wager_win", pot, WAGER_GAME_NAMES.get(w["game_type"], w["game_type"]))
+        add_coins(winner_id, pot); log_tx(winner_id, "wager_win", pot, game_name)
+        loser = w["opponent_id"] if winner_id == w["creator_id"] else w["creator_id"]
+        record_game(winner_id, "win", pot, w["game_type"]); record_game(loser, "loss", 0, w["game_type"])
     with db() as c:
-        c.execute("UPDATE wager_games SET status=? WHERE id=?", ("draw" if draw else "finished", wid))
-        c.commit()
+        c.execute("UPDATE wager_games SET status=? WHERE id=?", ("draw" if draw else "finished", wid)); c.commit()
     wager_games.pop(wid, None)
+    check_achievements(w["creator_id"]); check_achievements(w["opponent_id"])
     return w, "ok"
 
 def wager_invite_keyboard(wid):
@@ -586,7 +811,7 @@ async def start_wager_game(w):
     elif w["game_type"]=="cards":
         a=random.randint(1,13); b=random.randint(1,13)
         winner=creator if a>b else opponent if b>a else None
-        await finish_wager(gid,winner,draw=winner is None)
+        finish_wager(gid,winner,draw=winner is None)
         await send_bot_message(chat_id, f"🃏 جنگ کارت تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n"+(f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی شد؛ ورودی هر دو نفر برگشت."))
     elif w["game_type"]=="evenodd":
         wager_games[gid]["choices"]={}
@@ -597,20 +822,40 @@ async def start_wager_game(w):
         await send_bot_message(chat_id, f"🔢 حدس عدد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nبازیکن دوم باید عدد ۱ تا ۱۰ را حدس بزند.",
                                 reply_markup=keyboard([[button(str(i),f"wager:guess:{gid}:{i}") for i in range(1,6)],
                                                        [button(str(i),f"wager:guess:{gid}:{i}") for i in range(6,11)]]))
+    elif w["game_type"]=="dice":
+        a=random.randint(1,6); b=random.randint(1,6)
+        winner=creator if a>b else opponent if b>a else None
+        finish_wager(gid,winner,draw=winner is None)
+        await send_bot_message(chat_id, f"🎲 تاس جنگ تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n" + (f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی؛ ورودی‌ها برگشت."))
+    elif w["game_type"]=="coinflip":
+        result=random.choice(["شیر","خط"])
+        winner=creator if result=="شیر" else opponent
+        finish_wager(gid,winner)
+        await send_bot_message(chat_id, f"🪙 شیر یا خط دو نفره\n\n🎲 نتیجه: {result}\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور")
+    elif w["game_type"]=="blackjack":
+        a=random.randint(16,21); b=random.randint(16,21)
+        winner=creator if a>b else opponent if b>a else None
+        finish_wager(gid,winner,draw=winner is None)
+        await send_bot_message(chat_id, f"🃏 بلک‌جک ساده تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n" + (f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی؛ ورودی‌ها برگشت."))
+    elif w["game_type"]=="quickmath":
+        a=random.randint(2,20); b=random.randint(2,20); op=random.choice(["+","-","×"])
+        ans=a+b if op=="+" else a-b if op=="-" else a*b
+        winner=random.choice([creator,opponent]); finish_wager(gid,winner)
+        await send_bot_message(chat_id, f"⚡ مسابقه سرعت\n🧠 سوال: {a} {op} {b} = {ans}\n🏆 برنده سرعت: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور")
     elif w["game_type"]=="higher":
         a=random.randint(1,100); b=random.randint(1,100)
         winner=creator if a>b else opponent if b>a else None
-        await finish_wager(gid,winner,draw=winner is None)
+        finish_wager(gid,winner,draw=winner is None)
         await send_bot_message(chat_id, f"📈 بازی بالاتر تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n"+(f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی شد؛ ورودی هر دو نفر برگشت."))
 
 def display_name_by_id(user_id):
     try:
         row=get_user_record(user_id)
         if row:
-            return "@"+row[1] if row[1] else f"کاربر {user_id}"
+            return "@"+row[1] if row[1] else "بازیکن"
     except Exception:
         pass
-    return f"کاربر {user_id}"
+    return "بازیکن"
 
 def get_user_record(user_id):
     with db() as c:
@@ -2146,8 +2391,11 @@ def user_menu_keyboard():
         [button("⬆️ ارتقای لول","user:level"),button("📈 ترید","user:trade")],
         [button("🍀 ارتقای شانس","user:luck"),button("🧠 ارتقای تجربه","user:exp")],
         [button("🏦 بانک آریور","user:bank"),button("🛍️ فروشگاه","user:shop")],
-        [button("🏆 رتبه‌بندی","user:leaderboard"),button("🏷️ عنوان‌های من","user:titles")],
+        [button("📊 آمار من","user:stats"),button("🏅 دستاوردها","user:achievements")],
+        [button("🏆 رتبه‌بندی","user:leaderboard"),button("🥇 رنک و لیگ","user:rank")],
+        [button("🏷️ عنوان‌های من","user:titles"),button("🎒 کوله‌پشتی","user:inventory")],
         [button("🛒 بازار","user:market"),button("🎮 بازی‌ها","user:games")],
+        [button("🏆 تورنمنت","user:tournament")],
         [button("📜 تاریخچه","user:history")],
         [button("💸 انتقال آریور","user:transfer")],[button("📚 راهنما","user:help")]
     ])
@@ -2156,47 +2404,72 @@ def trade_keyboard(): return keyboard([[button("🎲 ترید 100 آریور","t
 
 def user_help_text():
     return ("📚 راهنمای کامل الناز 🤖✨\n\n"
-            "💰 بخش آریور\n"
+            "💰 آریور و پروفایل\n"
             "• «عاح» → دریافت آریور هر ۵ دقیقه ⏰\n"
-            "• «موجودی» → نمایش موجودی 💎\n"
-            "• «منو» → نمایش پروفایل 👤\n"
-            "• «ترید مقدار» → ترید با هر مبلغ مثبت موجود در کیف پول 🎲\n"
-            "• «ارتقای لول» → ارتقای لول اصلی با 10,000 آریور ⬆️\n"
-            "• «ارتقای لول شانس» → افزایش شانس ترید 🍀\n"
-            "• «ارتقای لول تجربه» → افزایش شانس ترید 🧠\n"
+            "• «موجودی» → موجودی کیف پول 💎\n"
+            "• «منو» → پروفایل و همه امکانات 👤\n"
+            "• «ترید مقدار» → ترید با هر مبلغ مثبت؛ شانس پایه با لول شانس و تجربه بهتر می‌شود 🎲\n"
+            "• «ارتقای لول» → +۱ لول اصلی با 10,000 آریور ⭐\n"
+            "• «ارتقای لول شانس» → هر لول +۴٪ شانس برد، هزینه لول بعدی 10,000 تا 100,000 🍀\n"
+            "• «ارتقای لول تجربه» → هر لول +۴٪ شانس برد، حداکثر مجموع شانس ۸۰٪ 🧠\n"
             "• «انتقال مقدار» با ریپلای → انتقال آریور 💸\n\n"
-            "🎁 جایزه و پیشرفت\n"
-            "• «جایزه روزانه» یا دکمه 🎁 → جعبه روزانه + استریک 🔥\n"
-            "• «ماموریت‌ها» → ۳ ماموریت روزانه و جایزه آن‌ها 🎯\n"
-            "• «رتبه‌بندی» → جدول برترین کاربران 🏆\n"
-            "• «تاریخچه» → آخرین تراکنش‌های آریور 📜\n\n"
+            "🎯 پیشرفت روزانه\n"
+            "• «جایزه روزانه» → جعبه روزانه و استریک 🔥\n"
+            "• «استریک» → استریک برد و استریک روزانه\n"
+            "• «ماموریت‌ها» → ۳ ماموریت روزانه و جایزه 🎯\n"
+            "• «آمار من» → بازی، برد، باخت، درصد برد، XP و بهترین جایزه 📊\n"
+            "• «دستاوردها» → Achievementهای قابل باز کردن 🏅\n\n"
+            "🥇 رنک و لیدربورد\n"
+            "• «رنک» → لیگ فعلی و امتیاز\n"
+            "• «رتبه‌بندی» → رتبه‌بندی موجودی\n"
+            "• «لیدربورد برد» → برترین‌ها از نظر تعداد برد\n"
+            "• «لیدربورد امتیاز» → برترین‌ها از نظر امتیاز ⭐\n\n"
             "🏦 بانک\n"
-            "• «بانک» → مشاهده موجودی بانک 🏦\n"
-            "• «واریز مقدار» → انتقال آریور از کیف پول به بانک 💰\n"
-            "• «برداشت مقدار» → برداشت از بانک 💳\n\n"
-            "🛍️ فروشگاه و عنوان\n"
-            "• «فروشگاه» → دیدن عنوان‌های قابل خرید 🛍️\n"
-            "• «خرید عنوان شماره» → خرید عنوان\n"
-            "• «عنوان‌های من» → عنوان‌های خریداری‌شده 🏷️\n"
-            "• «عنوان شماره» → انتخاب عنوان فعال\n\n"
-            "🛒 بازار\n"
-            "• «بازار» → دیدن آگهی‌های فعال\n"
-            "• «فروش مقدار قیمت» → گذاشتن آریور در بازار\n"
-            "• «لغو فروش شماره» → لغو آگهی خودت و برگشت آریور\n\n"
-            "🎮 بازی‌های کوچک\n"
-            "• «شیر یا خط» → بازی سرگرمی با آریور 💰🪙\n"
-            "• «حدس عدد» → بازی حدس عدد با جایزه محدود 🔢\n\n"
-            "🎭 بخش بازی مافیا\n"
-            "• «بازی مافیا» → شروع بازی 🎬\n"
-            "• «پایان بازی» / «بایان بازی» → پایان بازی 🛑\n"
-            "• «پایه‌ام» → ورود به بازی 👥\n"
-            "• دکمه‌های چالش، رد صحبت، رای و اقدامات شب → کنترل بازی 🎤🗳️🌙\n\n"
-            "💬 بخش گفتگو\n"
-            "• «الناز» → پاسخ الناز ✨\n"
-            "• «آرسین» یا «ارسین» → پاسخ مخصوص 😤\n"
-            "• «راهنما» / «راهنما الناز» → نمایش راهنما 📚\n\n"
-            "🔐 بخش ورود\n"
-            "• «/start» → ثبت‌نام و بررسی عضویت 🔗\n\n"
+            "• «بانک» → موجودی بانک 🏦\n"
+            "• «واریز مقدار» → واریز به بانک\n"
+            "• «برداشت مقدار» → برداشت از بانک\n\n"
+            "🛍️ فروشگاه و آیتم‌ها\n"
+            "• «فروشگاه» → عنوان‌ها و آیتم‌های کاربردی\n"
+            "• «خرید عنوان شماره» → خرید عنوان 🏷️\n"
+            "• «عنوان‌های من» → مشاهده و فعال‌سازی عنوان‌ها\n"
+            "• «آیتم‌ها» → مشاهده کوله‌پشتی 🎒\n"
+            "• آیتم‌های کاربردی: 🛡️ سپر، 🍀 شانس ویژه، 🎟️ بلیت بازی، 👑 عنوان VIP، ⚡ Boost XP\n\n"
+            "🛒 بازار بازیکنان\n"
+            "• «بازار» → بازار آریور\n"
+            "• «فروش مقدار قیمت» → فروش آریور\n"
+            "• «لغو فروش شماره» → لغو آگهی آریور\n"
+            "• «بازار آیتم» → آگهی‌های آیتمی\n"
+            "• «فروش آیتم نام آیتم تعداد قیمت» → فروش آیتم به بازیکنان\n"
+            "• «خرید آیتم شماره» → خرید آیتم از بازار\n\n"
+            "🎮 بازی‌های شرطی دو نفره\n"
+            "• «دوز 100» → دوز دو نفره\n"
+            "• «سنگ کاغذ قیچی 100» → انتخاب همزمان\n"
+            "• «جنگ کارت 100» → کارت بالاتر\n"
+            "• «زوج یا فرد 100» → انتخاب زوج یا فرد\n"
+            "• «حدس عدد 100» → بازیکن دوم عدد ۱ تا ۱۰ را انتخاب می‌کند\n"
+            "• «بالاتر 100» → عدد بالاتر برنده است\n"
+            "• «تاس جنگ 100» → تاس بالاتر برنده است\n"
+            "• «شیر یا خط دو نفره 100» → نتیجه شیر/خط\n"
+            "• «بلک‌جک ساده 100» → عدد نزدیک‌تر به ۲۱\n"
+            "• «مسابقه سرعت 100» → چالش سرعت\n"
+            "💎 مبلغ ورودی هر دو نفر برابر است؛ برنده کل مبلغ دو ورودی را می‌گیرد. اگر بازی مساوی شود، ورودی هر دو نفر برمی‌گردد. اگر دعوت تا ۶۰ ثانیه بدون شرکت بماند، مبلغ سازنده خودکار برمی‌گردد.\n\n"
+            "🏆 تورنمنت\n"
+            "• «تورنمنت 1000» → ساخت تورنمنت ۸ نفره در گروه\n"
+            "• ظرفیت ۸ نفر است و ورودی همه وارد جایزه نهایی می‌شود.\n"
+            "• ساختار: یک‌چهارم نهایی → نیمه‌نهایی → فینال 🥇\n"
+            "• اگر ظرفیت در ۱۲۰ ثانیه کامل نشود، همه ورودی‌ها برمی‌گردد.\n\n"
+            "📜 تاریخچه و امنیت\n"
+            "• «تاریخچه» → آخرین تراکنش‌ها\n"
+            "• تمام قفل/برگشت/برد/خرید/فروش‌ها ثبت می‌شوند. 🔐\n"
+            "• کلیک تکراری، بازی با خود و تغییر وضعیت بازی پس از پایان مسدود می‌شود. 🛡️\n\n"
+            "🎭 مافیا\n"
+            "• «بازی مافیا» → شروع بازی\n"
+            "• «پایان بازی» / «بایان بازی» → پایان بازی\n"
+            "• «پایه‌ام» → ورود به بازی پس از /start و عضویت در لینک‌های لازم\n\n"
+            "💬 «الناز» → پاسخ الناز\n"
+            "💬 «آرسین» یا «ارسین» → پاسخ مخصوص\n"
+            "📚 «راهنما» / «راهنما الناز» → همین راهنما\n"
+            "🔐 «/start» → ثبت‌نام و بررسی عضویت\n\n"
             "🛠️ توسعه‌دهنده: @arsin_mo")
 
 
@@ -2285,7 +2558,7 @@ async def wager_rps_callback(query: CallbackQuery):
     if a==b: winner=None
     elif winmap[a]==b: winner=w["creator_id"]
     else: winner=w["opponent_id"]
-    await finish_wager(wid,winner,draw=winner is None)
+    finish_wager(wid,winner,draw=winner is None)
     names={"rock":"✊ سنگ","paper":"📄 کاغذ","scissors":"✂️ قیچی"}
     text=f"✊✋✌️ نتیجه بازی\n\n👤 اول: {names[a]}\n👤 دوم: {names[b]}\n\n"
     text += "🤝 مساوی شد؛ ورودی‌ها برگشت." if winner is None else f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
@@ -2337,6 +2610,64 @@ async def wager_guess_callback(query: CallbackQuery):
         text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
     await query.message.edit_text(text)
     await query.answer()
+
+
+@dp.callback_query(F.data=="user:rank")
+async def user_rank(query:CallbackQuery):
+    rank,points=player_rank(query.from_user.id); st=player_stats(query.from_user.id)
+    await query.message.edit_text(f"🥇 رنک و لیگ\n\n🏆 {rank}\n⭐ امتیاز: {points}\n🔥 بهترین استریک: {st['best_streak']}\n\nهر برد ۲۵ امتیاز می‌دهد؛ مساوی ۵ امتیاز و باخت ۱۰ امتیاز کم می‌کند.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:stats")
+async def user_stats(query:CallbackQuery):
+    uid=query.from_user.id; st=player_stats(uid); rank,points=player_rank(uid)
+    wr=(st["wins"]*100//st["games"]) if st["games"] else 0
+    await query.message.edit_text(f"📊 آمار کامل بازیکن\n\n🏆 رنک: {rank}\n⭐ امتیاز: {points}\n🎮 بازی‌ها: {st['games']}\n🏆 برد: {st['wins']}\n💔 باخت: {st['losses']}\n🤝 مساوی: {st['draws']}\n📈 درصد برد: {wr}%\n💰 بهترین جایزه: {format_coins(st['best_win'])} آریور\n🧠 XP: {st['xp']}",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:achievements")
+async def user_achievements(query:CallbackQuery):
+    owned=set(achievements_list(query.from_user.id)); lines=[]
+    for code,(name,desc,target) in ACHIEVEMENT_DEFS.items(): lines.append(f"{'✅' if code in owned else '🔒'} {name} — {desc}")
+    await query.message.edit_text("🏅 دستاوردها\n\n"+"\n".join(lines),reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:inventory")
+async def user_inventory(query:CallbackQuery):
+    await query.message.edit_text(inventory_text(query.from_user.id),reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:tournament")
+async def user_tournament_help(query:CallbackQuery):
+    await query.message.edit_text("🏆 تورنمنت ۸ نفره\n\n👥 ظرفیت: ۸ بازیکن\n💎 ورودی هر نفر: مبلغی که سازنده تعیین می‌کند\n🏆 کل ورودی‌ها جایزه نهایی است.\n🥊 ساختار: یک‌چهارم نهایی → نیمه‌نهایی → فینال\n⏳ اگر تا ۱۲۰ ثانیه ظرفیت کامل نشود، ورودی‌ها به شرکت‌کنندگان برمی‌گردد.\n\n📌 دستور: تورنمنت 1000",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data.startswith("tournament:join:"))
+async def tournament_join_callback(query:CallbackQuery):
+    try: tid=int(query.data.rsplit(":",1)[1])
+    except Exception: await query.answer("❌ تورنمنت نامعتبر است.",show_alert=True); return
+    t,status=tournament_join(tid,query.from_user.id)
+    if status=="funds": await query.answer("❌ موجودی کافی نیست.",show_alert=True); return
+    if status=="self": await query.answer("😄 خودت قبلاً وارد شدی.",show_alert=True); return
+    if status=="full": await query.answer("❌ ظرفیت پر است.",show_alert=True); return
+    if status=="expired": await query.answer("⏰ زمان ثبت‌نام تمام شده.",show_alert=True); return
+    if status=="closed": await query.answer("❌ تورنمنت بسته شده.",show_alert=True); return
+    ps=tournament_players(tid); await query.answer(f"✅ وارد شدی! {len(ps)}/8 نفر")
+    try: await query.message.edit_text(f"🏆 تورنمنت در حال ثبت‌نام است!\n\n👥 بازیکنان: {len(ps)}/8\n💎 ورودی: {format_coins(t['stake'])} آریور\n🏆 جایزه فعلی: {format_coins(t['prize'])} آریور\n\n⏳ با تکمیل ۸ نفر، یک‌چهارم نهایی شروع می‌شود.",reply_markup=keyboard([[button("🏆 شرکت در تورنمنت",f"tournament:join:{tid}")]]))
+    except Exception: pass
+    if len(ps)>=8:
+        await bot.send_message(t["chat_id"],f"🏆 تورنمنت #{tid} با ۸ بازیکن کامل شد!\n🥊 مرحله یک‌چهارم نهایی شروع می‌شود...")
+        result=tournament_round(tid)
+        if result and result[0]=="round":
+            await bot.send_message(t["chat_id"],"🏆 نتایج مرحله یک‌چهارم نهایی:\n\n"+"\n".join(f"⚔️ {display_name_by_id(a)} × {display_name_by_id(b)} → 🏆 {display_name_by_id(w)}" for a,b,w,l in result[3])+"\n\n➡️ مرحله بعدی: نیمه‌نهایی")
+            result2=tournament_round(tid)
+            if result2 and result2[0]=="round":
+                await bot.send_message(t["chat_id"],"🔥 نتایج نیمه‌نهایی:\n\n"+"\n".join(f"⚔️ {display_name_by_id(a)} × {display_name_by_id(b)} → 🏆 {display_name_by_id(w)}" for a,b,w,l in result2[3])+"\n\n➡️ فینال")
+                result3=tournament_round(tid)
+                if result3 and result3[0]=="final": await bot.send_message(t["chat_id"],f"👑 قهرمان تورنمنت #{tid}: {display_name_by_id(result3[1])}\n💎 جایزه: {format_coins(result3[2])} آریور")
+
+@dp.callback_query(F.data.startswith("shopv2:buy:"))
+async def shop_v2_buy_callback(query:CallbackQuery):
+    try: idx=int(query.data.rsplit(":",1)[1]); item=list(SHOP_ITEMS_V2)[idx-1]
+    except Exception: await query.answer("❌ آیتم نامعتبر.",show_alert=True); return
+    ok,why,cost=shop_v2_buy(query.from_user.id,item)
+    if not ok: await query.answer(f"❌ {format_coins(cost)} آریور لازم داری.",show_alert=True); return
+    await query.answer(f"✅ {item} خریداری شد!"); await user_shop(query)
 
 @dp.callback_query(F.data=="user:daily")
 async def user_daily(query:CallbackQuery):
@@ -2807,8 +3138,20 @@ async def handle_text(message: Message):
         amount=int(m.group(1).replace(',','')); ok,b=bank_withdraw(message.from_user.id,amount); await message.reply(f"{'✅ برداشت شد.' if ok else '❌ موجودی بانک کافی نیست.'} 🏦\n💳 بانک: {format_coins(b)} آریور"); return
     if text in ("بانک","بانک آریور"):
         await message.reply(f"🏦 موجودی بانک: {format_coins(bank_balance(message.from_user.id))} آریور 💎"); return
+    if text in ("آمار","آمار کامل","stats"):
+        st=player_stats(message.from_user.id); rank,points=player_rank(message.from_user.id); wr=(st["wins"]*100//st["games"]) if st["games"] else 0
+        await message.reply(f"📊 آمار کامل\n🏆 رنک: {rank}\n⭐ امتیاز: {points}\n🎮 بازی: {st['games']}\n🏆 برد: {st['wins']}\n💔 باخت: {st['losses']}\n🤝 مساوی: {st['draws']}\n📈 درصد برد: {wr}%\n💰 بهترین جایزه: {format_coins(st['best_win'])} آریور\n🧠 XP: {st['xp']}"); return
+    if text in ("دستاوردها","دستاورد ها"):
+        owned=set(achievements_list(message.from_user.id)); await message.reply("🏅 دستاوردها\n\n"+"\n".join(f"{'✅' if code in owned else '🔒'} {name} — {desc}" for code,(name,desc,target) in ACHIEVEMENT_DEFS.items())); return
+    if text in ("رنک","rank"):
+        rank,points=player_rank(message.from_user.id); await message.reply(f"🏆 رنک شما: {rank}\n⭐ امتیاز: {points}"); return
+    if text in ("آیتم‌ها","آیتم ها","اینونتوری"):
+        await message.reply(inventory_text(message.from_user.id)); return
     if text in ("فروشگاه","shop"):
-        await message.answer("🛍️ فروشگاه عنوان و آیتم‌های نمایشی:\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard([[button(f"خرید عنوان {i}",f"shop:buy:{i}")] for i in range(1,len(SHOP_ITEMS)+1)])); return
+        title_lines="\n".join(f"🏷️ عنوان {i}: {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1))
+        item_lines="\n".join(f"🎁 آیتم {i}: {t} — {format_coins(v[0])} آریور" for i,(t,v) in enumerate(SHOP_ITEMS_V2.items(),1))
+        kb=[[button(f"🏷️ خرید عنوان {i}",f"shop:buy:{i}")] for i in range(1,len(SHOP_ITEMS)+1)] + [[button(f"🎁 خرید آیتم {i}",f"shopv2:buy:{i}")] for i in range(1,len(SHOP_ITEMS_V2)+1)]
+        await message.answer("🛍️ فروشگاه\n\n"+title_lines+"\n\n"+item_lines,reply_markup=keyboard(kb)); return
     m=re.fullmatch(r"خرید عنوان\s+(\d+)",text)
     if m:
         idx=int(m.group(1));
@@ -2880,39 +3223,83 @@ async def handle_text(message: Message):
             label='@'+target.username if target.username else f'کاربر {target.id}'
             await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(state)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
 
-    # Player-vs-player wager games.
-    wager_patterns = [
-        (r"دوز\s+([0-9][0-9,]*)", "dooz"),
-        (r"سنگ\s+کاغذ\s+قیچی\s+([0-9][0-9,]*)", "rps"),
-        (r"جنگ\s+کارت\s+([0-9][0-9,]*)", "cards"),
-        (r"زوج\s+یا\s+فرد\s+([0-9][0-9,]*)", "evenodd"),
-        (r"حدس\s+عدد\s+([0-9][0-9,]*)", "guess"),
-        (r"بالاتر\s+([0-9][0-9,]*)", "higher"),
-    ]
-    for pattern, game_type in wager_patterns:
-        wm = re.fullmatch(pattern, text)
-        if wm:
-            stake = int(wm.group(1).replace(",", ""))
-            if stake <= 0:
-                await message.reply("❌ مبلغ ورودی باید بیشتر از صفر باشد. 💎")
+    if text in ("استریک","streak"):
+        await message.reply(streak_text(message.from_user.id)); return
+    if text in ("آمار من","آمار","stats"):
+        st=player_stats(message.from_user.id); rank,points=player_rank(message.from_user.id); wr=(st["wins"]*100//st["games"]) if st["games"] else 0
+        await message.reply(f"📊 آمار کامل\n🏆 رنک: {rank}\n⭐ امتیاز: {points}\n🎮 بازی: {st['games']}\n🏆 برد: {st['wins']}\n💔 باخت: {st['losses']}\n🤝 مساوی: {st['draws']}\n📈 درصد برد: {wr}%\n💰 بهترین جایزه: {format_coins(st['best_win'])} آریور\n🧠 XP: {st['xp']}\n🔥 استریک برد: {st['win_streak']}\n👑 بهترین استریک: {st['best_streak']}"); return
+    if text in ("رنک","rank"):
+        rank,points=player_rank(message.from_user.id); await message.reply(f"🥇 رنک شما: {rank}\n⭐ امتیاز: {points}"); return
+    if text in ("لیدربورد برد","بردها"):
+        rows=leaderboard_wins(); await message.reply("🏆 لیدربورد برد\n\n"+"\n".join(f"{i}. {'@'+u if u else 'بازیکن'} — 🏆 {w} برد" for i,(uid,u,w,g,p) in enumerate(rows,1))); return
+    if text in ("لیدربورد امتیاز","امتیازات"):
+        rows=leaderboard_points(); await message.reply("⭐ لیدربورد امتیاز\n\n"+"\n".join(f"{i}. {'@'+u if u else 'بازیکن'} — ⭐ {p}" for i,(uid,u,p,w,g,bs) in enumerate(rows,1))); return
+    if text in ("آیتم‌ها","آیتم ها","اینونتوری"):
+        await message.reply(inventory_text(message.from_user.id)); return
+    if text=="بازار آیتم":
+        rows=active_item_market(); await message.reply("🛒 بازار آیتم\n\n"+"\n".join(f"#{lid} — {item} × {qty} — 💎 {format_coins(price)} — {'@'+get_user_record(seller)[1] if get_user_record(seller) and get_user_record(seller)[1] else 'بازیکن'}" for lid,seller,item,qty,price,created in rows) or "🛒 بازار آیتم خالی است."); return
+    m=re.fullmatch(r"فروش آیتم\\s+(.+?)\\s+(\\d+)\\s+([0-9,]+)",text)
+    if m:
+        item=m.group(1).strip(); qty=int(m.group(2)); price=int(m.group(3).replace(',',''))
+        ok=create_item_listing(message.from_user.id,item,qty,price); await message.reply("✅ آیتم در بازار قرار گرفت. 🛒" if ok else "❌ آیتم، تعداد یا موجودی نامعتبر است. 🎒"); return
+    m=re.fullmatch(r"خرید آیتم\\s+(\\d+)",text)
+    if m:
+        ok,why,price=buy_item_listing(message.from_user.id,int(m.group(1)))
+        await message.reply("✅ آیتم خریداری شد. 🎁" if ok else ("❌ موجودی کافی نیست. 💎" if why=="funds" else "❌ آگهی پیدا نشد یا قابل خرید نیست. 🛒")); return
+
+    tm=re.fullmatch(r"تورنمنت\s+([0-9][0-9,]*)",text)
+    if tm and message.chat.type in ("group","supergroup"):
+        stake=int(tm.group(1).replace(",","")); tid,status=tournament_create(message.chat.id,message.from_user.id,stake)
+        if status=="funds": await message.reply("❌ موجودی کافی نیست. 💎"); return
+        sent=await message.answer(f"🏆 تورنمنت ۸ نفره ساخته شد!\n\n👤 سازنده: {display_name_by_id(message.from_user.id)}\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n🏆 جایزه فعلی: {format_coins(stake)} آریور\n👥 ظرفیت: 1/8\n⏳ فرصت تکمیل: {TOURNAMENT_WAIT_SECONDS} ثانیه",reply_markup=keyboard([[button("🏆 شرکت در تورنمنت",f"tournament:join:{tid}")]]))
+        with db() as c: c.execute("UPDATE tournaments SET message_id=? WHERE id=?",(sent.message_id,tid)); c.commit()
+        async def expire_tournament():
+            await asyncio.sleep(TOURNAMENT_WAIT_SECONDS); t=tournament_get(tid)
+            if not t or t["status"]!="waiting": return
+            ps=tournament_players(tid)
+            for u in ps: add_coins(u,t["stake"]); log_tx(u,"tournament_refund",t["stake"],f"tid={tid}")
+            with db() as c: c.execute("UPDATE tournaments SET status='refunded' WHERE id=?",(tid,)); c.commit()
+            try: await bot.edit_message_text(f"⏰ تورنمنت #{tid} لغو شد؛ ظرفیت ۸ نفر تکمیل نشد.\n💎 ورودی همه بازیکنان برگشت داده شد.",chat_id=t["chat_id"],message_id=t["message_id"])
+            except Exception: pass
+        asyncio.create_task(expire_tournament()); return
+    # Player-vs-player wager games (groups only).
+    if message.chat.type in ("group", "supergroup"):
+        wager_patterns = [
+            (r"دوز\s+([0-9][0-9,]*)", "dooz"),
+            (r"سنگ\s+کاغذ\s+قیچی\s+([0-9][0-9,]*)", "rps"),
+            (r"جنگ\s+کارت\s+([0-9][0-9,]*)", "cards"),
+            (r"زوج\s+یا\s+فرد\s+([0-9][0-9,]*)", "evenodd"),
+            (r"حدس\s+عدد\s+([0-9][0-9,]*)", "guess"),
+            (r"بالاتر\s+([0-9][0-9,]*)", "higher"),
+            (r"تاس جنگ\s+([0-9][0-9,]*)", "dice"),
+            (r"شیر یا خط دو نفره\s+([0-9][0-9,]*)", "coinflip"),
+            (r"بلک‌جک ساده\s+([0-9][0-9,]*)", "blackjack"),
+            (r"مسابقه سرعت\s+([0-9][0-9,]*)", "quickmath"),
+        ]
+        for pattern, game_type in wager_patterns:
+            wm = re.fullmatch(pattern, text)
+            if wm:
+                stake = int(wm.group(1).replace(",", ""))
+                if stake <= 0:
+                    await message.reply("❌ مبلغ ورودی باید بیشتر از صفر باشد. 💎")
+                    return
+                wid, status = create_wager(message.chat.id, message.from_user.id, game_type, stake)
+                if status == "funds":
+                    await message.reply(f"❌ برای ساخت این بازی حداقل {format_coins(stake)} آریور موجودی لازم داری. 💎")
+                    return
+                name = WAGER_GAME_NAMES[game_type]
+                sent = await message.answer(
+                    f"🎮 بازی «{name}» ساخته شد! 🔥\n\n"
+                    f"👤 سازنده: {('@'+message.from_user.username) if message.from_user.username else message.from_user.full_name}\n"
+                    f"💎 مبلغ ورودی هر نفر: {format_coins(stake)} آریور\n"
+                    f"🏆 جایزه برنده: {format_coins(stake*2)} آریور\n"
+                    f"⏳ فرصت شرکت: {WAGER_WAIT_SECONDS} ثانیه\n\n"
+                    f"👥 یک نفر روی «شرکت کردن» بزند تا بازی شروع شود.",
+                    reply_markup=wager_invite_keyboard(wid)
+                )
+                set_wager_message(wid, sent.message_id)
+                asyncio.create_task(wager_expiry_task(wid))
                 return
-            wid, status = create_wager(message.chat.id, message.from_user.id, game_type, stake)
-            if status == "funds":
-                await message.reply(f"❌ برای ساخت این بازی حداقل {format_coins(stake)} آریور موجودی لازم داری. 💎")
-                return
-            name = WAGER_GAME_NAMES[game_type]
-            sent = await message.answer(
-                f"🎮 بازی «{name}» ساخته شد! 🔥\n\n"
-                f"👤 سازنده: {('@'+message.from_user.username) if message.from_user.username else message.from_user.full_name}\n"
-                f"💎 مبلغ ورودی هر نفر: {format_coins(stake)} آریور\n"
-                f"🏆 جایزه برنده: {format_coins(stake*2)} آریور\n"
-                f"⏳ فرصت شرکت: {WAGER_WAIT_SECONDS} ثانیه\n\n"
-                f"👥 یک نفر روی «شرکت کردن» بزند تا بازی شروع شود.",
-                reply_markup=wager_invite_keyboard(wid)
-            )
-            set_wager_message(wid, sent.message_id)
-            asyncio.create_task(wager_expiry_task(wid))
-            return
 
     # Safe in-game mini-games using Arioor only.
     if text.startswith("شیر یا خط"):
