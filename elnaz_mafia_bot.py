@@ -97,6 +97,7 @@ games = {}
 pending_link = {}
 pending_admin = {}
 transfer_pending = {}
+market_pending = {}
 
 # ================================================================
 # DATABASE
@@ -122,6 +123,13 @@ def init_db():
         if "mode" not in gift_cols:
             c.execute("ALTER TABLE gift_codes ADD COLUMN mode TEXT DEFAULT 'multi'")
         c.execute("CREATE TABLE IF NOT EXISTS gift_redemptions(code TEXT NOT NULL, user_id INTEGER NOT NULL, redeemed_at INTEGER NOT NULL, PRIMARY KEY(code,user_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS daily_state(user_id INTEGER PRIMARY KEY, last_box INTEGER DEFAULT 0, streak INTEGER DEFAULT 0, last_streak_day TEXT DEFAULT '')")
+        c.execute("CREATE TABLE IF NOT EXISTS missions(user_id INTEGER NOT NULL, day TEXT NOT NULL, mtype TEXT NOT NULL, target INTEGER NOT NULL, progress INTEGER DEFAULT 0, reward INTEGER NOT NULL, claimed INTEGER DEFAULT 0, PRIMARY KEY(user_id,day,mtype))")
+        c.execute("CREATE TABLE IF NOT EXISTS bank(user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS titles(user_id INTEGER NOT NULL, title TEXT NOT NULL, PRIMARY KEY(user_id,title))")
+        c.execute("CREATE TABLE IF NOT EXISTS user_title(user_id INTEGER PRIMARY KEY, title TEXT DEFAULT '')")
+        c.execute("CREATE TABLE IF NOT EXISTS market(listing_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, amount INTEGER NOT NULL, price INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, balance_after INTEGER NOT NULL, note TEXT DEFAULT '', created_at INTEGER DEFAULT 0)")
         c.commit()
 
 
@@ -199,6 +207,8 @@ def process_ah(user_id):
     with db() as c:
         c.execute("INSERT INTO coins(user_id,balance,last_ah,ah_count,level,luck_level,exp_level) VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance,last_ah=excluded.last_ah,ah_count=excluded.ah_count,level=excluded.level",(user_id,reward+level_reward,int(time.time()),count,level,r["luck_level"],r["exp_level"]))
         c.commit()
+    log_tx(user_id,"ah",reward+level_reward,"عاح")
+    bump_mission(user_id,"ah")
     return {**get_coin_row(user_id),"reward":reward,"level_reward":level_reward,"leveled_up":leveled}
 
 def upgrade_level(user_id):
@@ -222,12 +232,197 @@ def do_trade(user_id,amount):
     if amount <= 0: return None,r,"amount"
     if r["balance"]<amount: return None,r,"funds"
     win=min(80,r["luck_level"]*4+r["exp_level"]*4)
-    if random.random()<win/100: net=random.randint(1,amount-1)
+    if amount == 1:
+        net = 0
+    elif random.random()<win/100: net=random.randint(1,amount-1)
     else: net=-random.randint(1,amount-1)
     payout=amount+net
     with db() as c:
         c.execute("UPDATE coins SET balance=balance-?+? WHERE user_id=?",(amount,payout,user_id)); c.commit()
     return net,get_coin_row(user_id),"ok"
+
+# ================================================================
+# ARIOOR EXTENDED ECONOMY
+# ================================================================
+
+def log_tx(user_id, kind, amount, note=""):
+    with db() as c:
+        bal = c.execute("SELECT balance FROM coins WHERE user_id=?", (user_id,)).fetchone()
+        balance = int(bal[0]) if bal else 0
+        c.execute("INSERT INTO transactions(user_id,kind,amount,balance_after,note,created_at) VALUES(?,?,?,?,?,?)",
+                  (user_id, kind, int(amount), balance, note, int(time.time())))
+        c.commit()
+
+
+def today_key():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def yesterday_key():
+    return time.strftime("%Y-%m-%d", time.localtime(time.time()-86400))
+
+
+def get_daily_state(user_id):
+    with db() as c:
+        row=c.execute("SELECT last_box,streak,last_streak_day FROM daily_state WHERE user_id=?",(user_id,)).fetchone()
+    if not row:
+        return {"last_box":0,"streak":0,"last_streak_day":""}
+    return {"last_box":int(row[0] or 0),"streak":int(row[1] or 0),"last_streak_day":row[2] or ""}
+
+
+def claim_daily_box(user_id):
+    st=get_daily_state(user_id); now_ts=int(time.time()); remain=86400-(now_ts-st["last_box"])
+    if st["last_box"] and remain>0:
+        return False, st, remain, 0
+    today=today_key()
+    if st["last_streak_day"]==yesterday_key(): streak=st["streak"]+1
+    elif st["last_streak_day"]==today: streak=max(1,st["streak"])
+    else: streak=1
+    reward=min(5000,500+max(0,streak-1)*250)
+    add_coins(user_id,reward)
+    with db() as c:
+        c.execute("INSERT INTO daily_state(user_id,last_box,streak,last_streak_day) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_box=excluded.last_box,streak=excluded.streak,last_streak_day=excluded.last_streak_day",(user_id,now_ts,streak,today))
+        c.commit()
+    log_tx(user_id,"daily_box",reward,f"streak={streak}")
+    return True,{"last_box":now_ts,"streak":streak,"last_streak_day":today},0,reward
+
+
+def ensure_missions(user_id):
+    day=today_key()
+    mission_defs=[("ah",3,600),("trade",2,900),("transfer",1,700)]
+    with db() as c:
+        for typ,target,reward in mission_defs:
+            c.execute("INSERT OR IGNORE INTO missions(user_id,day,mtype,target,progress,reward,claimed) VALUES(?,?,?,?,0,?,0)",(user_id,day,typ,target,reward))
+        c.commit()
+
+
+def mission_rows(user_id):
+    ensure_missions(user_id)
+    with db() as c:
+        return c.execute("SELECT mtype,target,progress,reward,claimed FROM missions WHERE user_id=? AND day=? ORDER BY mtype",(user_id,today_key())).fetchall()
+
+
+def mission_label(typ):
+    return {"ah":"۳ بار عاح بزن","trade":"۲ ترید انجام بده","transfer":"۱ انتقال آریور انجام بده"}.get(typ,typ)
+
+
+def bump_mission(user_id, typ, amount=1):
+    ensure_missions(user_id)
+    with db() as c:
+        c.execute("UPDATE missions SET progress=MIN(target,progress+?) WHERE user_id=? AND day=? AND mtype=? AND claimed=0",(amount,user_id,today_key(),typ))
+        c.commit()
+
+
+def claim_mission(user_id, typ):
+    ensure_missions(user_id)
+    with db() as c:
+        row=c.execute("SELECT target,progress,reward,claimed FROM missions WHERE user_id=? AND day=? AND mtype=?",(user_id,today_key(),typ)).fetchone()
+        if not row: return False,"missing",0
+        target,progress,reward,claimed=map(int,row)
+        if claimed: return False,"claimed",reward
+        if progress<target: return False,"incomplete",reward
+        c.execute("UPDATE missions SET claimed=1 WHERE user_id=? AND day=? AND mtype=?",(user_id,today_key(),typ)); c.commit()
+    add_coins(user_id,reward); log_tx(user_id,"mission",reward,typ)
+    return True,"ok",reward
+
+
+def bank_balance(user_id):
+    with db() as c:
+        row=c.execute("SELECT balance FROM bank WHERE user_id=?",(user_id,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def bank_deposit(user_id,amount):
+    if amount<=0 or get_balance(user_id)<amount: return False,bank_balance(user_id)
+    add_coins(user_id,-amount)
+    with db() as c:
+        c.execute("INSERT INTO bank(user_id,balance) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance",(user_id,amount)); c.commit()
+    log_tx(user_id,"bank_deposit",-amount,f"deposit={amount}")
+    return True,bank_balance(user_id)
+
+
+def bank_withdraw(user_id,amount):
+    if amount<=0 or bank_balance(user_id)<amount: return False,bank_balance(user_id)
+    with db() as c:
+        c.execute("UPDATE bank SET balance=balance-? WHERE user_id=?",(amount,user_id)); c.commit()
+    add_coins(user_id,amount); log_tx(user_id,"bank_withdraw",amount,f"withdraw={amount}")
+    return True,bank_balance(user_id)
+
+
+SHOP_ITEMS={
+    "🏅 تازه‌کار":1000,
+    "🔥 حرفه‌ای":5000,
+    "👑 افسانه‌ای":15000,
+    "💎 اشرافی":30000,
+}
+
+def owned_titles(user_id):
+    with db() as c:
+        return [r[0] for r in c.execute("SELECT title FROM titles WHERE user_id=? ORDER BY title",(user_id,)).fetchall()]
+
+
+def current_title(user_id):
+    with db() as c:
+        r=c.execute("SELECT title FROM user_title WHERE user_id=?",(user_id,)).fetchone()
+    return r[0] if r and r[0] else ""
+
+
+def buy_title(user_id,title):
+    if title not in SHOP_ITEMS: return False,"invalid",0
+    if title in owned_titles(user_id): return False,"owned",SHOP_ITEMS[title]
+    cost=SHOP_ITEMS[title]
+    if get_balance(user_id)<cost: return False,"funds",cost
+    add_coins(user_id,-cost)
+    with db() as c:
+        c.execute("INSERT INTO titles(user_id,title) VALUES(?,?)",(user_id,title)); c.commit()
+    log_tx(user_id,"shop",-cost,title)
+    return True,"ok",cost
+
+
+def equip_title(user_id,title):
+    if title not in owned_titles(user_id): return False
+    with db() as c:
+        c.execute("INSERT INTO user_title(user_id,title) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET title=excluded.title",(user_id,title)); c.commit()
+    return True
+
+
+def leaderboard(limit=10):
+    with db() as c:
+        return c.execute("SELECT u.id,u.username,c.balance,c.level,c.luck_level,c.exp_level FROM users u JOIN coins c ON c.user_id=u.id ORDER BY c.balance DESC LIMIT ?",(limit,)).fetchall()
+
+
+def recent_transactions(user_id,limit=10):
+    with db() as c:
+        return c.execute("SELECT kind,amount,balance_after,note,created_at FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT ?",(user_id,limit)).fetchall()
+
+
+def create_market_listing(seller_id,amount,price):
+    if amount<=0 or price<=0 or get_balance(seller_id)<amount: return False
+    add_coins(seller_id,-amount)
+    with db() as c:
+        c.execute("INSERT INTO market(seller_id,amount,price,active,created_at) VALUES(?,?,?,1,?)",(seller_id,amount,price,int(time.time()))); c.commit()
+    log_tx(seller_id,"market_lock",-amount,f"listing price={price}")
+    return True
+
+
+def active_market(limit=10):
+    with db() as c:
+        return c.execute("SELECT listing_id,seller_id,amount,price,created_at FROM market WHERE active=1 ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()
+
+
+def buy_market_listing(buyer_id,listing_id):
+    with db() as c:
+        row=c.execute("SELECT seller_id,amount,price,active FROM market WHERE listing_id=?",(listing_id,)).fetchone()
+        if not row: return False,"missing",0,0
+        seller,amount,price,active=row
+        if not active: return False,"inactive",0,0
+        if seller==buyer_id: return False,"self",0,0
+        if get_balance(buyer_id)<price: return False,"funds",price,amount
+        c.execute("UPDATE market SET active=0 WHERE listing_id=? AND active=1",(listing_id,)); c.commit()
+    add_coins(buyer_id,amount); add_coins(seller,price)
+    log_tx(buyer_id,"market_buy",amount,f"paid={price}")
+    log_tx(seller,"market_sell",price,f"sold={amount}")
+    return True,"ok",price,amount
 
 def active_gifts():
     with db() as c:
@@ -674,6 +869,7 @@ async def start_game_setup(message):
 
     game = new_game(message)
     games[message.chat.id] = game
+    bump_mission(message.from_user.id,"trade",0)
 
     sent = await message.answer(
         "🎭 بدون آرسین می‌خواین بازی کنین؟ باشه، ولی دفعه آخرتون باشه 😤😂",
@@ -1728,10 +1924,21 @@ async def finish_game(chat_id):
 # ================================================================
 def profile_text(uid):
     r=get_coin_row(uid); win=min(80,r["luck_level"]*4+r["exp_level"]*4)
-    return (f"👤 منوی کاربر الناز ✨\n\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}")
+    title=current_title(uid) or "بدون عنوان"
+    st=get_daily_state(uid)
+    return (f"👤 منوی کاربر الناز ✨\n\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n🏦 بانک: {format_coins(bank_balance(uid))} آریور\n🏷️ عنوان: {title}\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}\n🔥 استریک روزانه: {st['streak']}")
 
 def user_menu_keyboard():
-    return keyboard([[button("⬆️ ارتقای لول","user:level")],[button("📈 ترید","user:trade")],[button("🍀 ارتقای لول شانس","user:luck")],[button("🧠 ارتقای لول تجربه","user:exp")],[button("💸 انتقال آریور","user:transfer")],[button("📚 راهنما","user:help")]])
+    return keyboard([
+        [button("🎁 جایزه روزانه","user:daily"),button("🎯 ماموریت‌ها","user:missions")],
+        [button("⬆️ ارتقای لول","user:level"),button("📈 ترید","user:trade")],
+        [button("🍀 ارتقای شانس","user:luck"),button("🧠 ارتقای تجربه","user:exp")],
+        [button("🏦 بانک آریور","user:bank"),button("🛍️ فروشگاه","user:shop")],
+        [button("🏆 رتبه‌بندی","user:leaderboard"),button("🏷️ عنوان‌های من","user:titles")],
+        [button("🛒 بازار","user:market"),button("🎮 بازی‌ها","user:games")],
+        [button("📜 تاریخچه","user:history")],
+        [button("💸 انتقال آریور","user:transfer")],[button("📚 راهنما","user:help")]
+    ])
 
 def trade_keyboard(): return keyboard([[button("🎲 ترید 100 آریور","trade:100")],[button("🎲 ترید 1,000 آریور","trade:1000")],[button("🎲 ترید 10,000 آریور","trade:10000")],[button("🔙 برگشت به منو","user:menu")]])
 
@@ -1739,25 +1946,146 @@ def user_help_text():
     return ("📚 راهنمای کامل الناز 🤖✨\n\n"
             "💰 بخش آریور\n"
             "• «عاح» → دریافت آریور هر ۵ دقیقه ⏰\n"
-            "• «موجودی» → نمایش موجودی 💰\n"
+            "• «موجودی» → نمایش موجودی 💎\n"
             "• «منو» → نمایش پروفایل 👤\n"
-            "• «ترید مقدار» → ترید مستقیم با هر مبلغی که موجودی‌اش را داشته باشی 🎲\n"
-            "• «ارتقای لول» → ارتقای لول اصلی با هزینه 10,000 آریور ⬆️\n"
+            "• «ترید مقدار» → ترید با هر مبلغ مثبت موجود در کیف پول 🎲\n"
+            "• «ارتقای لول» → ارتقای لول اصلی با 10,000 آریور ⬆️\n"
             "• «ارتقای لول شانس» → افزایش شانس ترید 🍀\n"
-            "• «ارتقای لول تجربه» → افزایش تجربه ترید 🧠\n"
-            "• «انتقال 500» با ریپلای به کاربر → انتقال آریور 💸\n\n"
+            "• «ارتقای لول تجربه» → افزایش شانس ترید 🧠\n"
+            "• «انتقال مقدار» با ریپلای → انتقال آریور 💸\n\n"
+            "🎁 جایزه و پیشرفت\n"
+            "• «جایزه روزانه» یا دکمه 🎁 → جعبه روزانه + استریک 🔥\n"
+            "• «ماموریت‌ها» → ۳ ماموریت روزانه و جایزه آن‌ها 🎯\n"
+            "• «رتبه‌بندی» → جدول برترین کاربران 🏆\n"
+            "• «تاریخچه» → آخرین تراکنش‌های آریور 📜\n\n"
+            "🏦 بانک\n"
+            "• «بانک» → مشاهده موجودی بانک 🏦\n"
+            "• «واریز مقدار» → انتقال آریور از کیف پول به بانک 💰\n"
+            "• «برداشت مقدار» → برداشت از بانک 💳\n\n"
+            "🛍️ فروشگاه و عنوان\n"
+            "• «فروشگاه» → دیدن عنوان‌های قابل خرید 🛍️\n"
+            "• «خرید عنوان شماره» → خرید عنوان\n"
+            "• «عنوان‌های من» → عنوان‌های خریداری‌شده 🏷️\n"
+            "• «عنوان شماره» → انتخاب عنوان فعال\n\n"
+            "🛒 بازار\n"
+            "• «بازار» → دیدن آگهی‌های فعال\n"
+            "• «فروش مقدار قیمت» → گذاشتن آریور در بازار\n"
+            "• «لغو فروش شماره» → لغو آگهی خودت و برگشت آریور\n\n"
+            "🎮 بازی‌های کوچک\n"
+            "• «شیر یا خط» → بازی سرگرمی با آریور 💰🪙\n"
+            "• «حدس عدد» → بازی حدس عدد با جایزه محدود 🔢\n\n"
             "🎭 بخش بازی مافیا\n"
             "• «بازی مافیا» → شروع بازی 🎬\n"
             "• «پایان بازی» / «بایان بازی» → پایان بازی 🛑\n"
             "• «پایه‌ام» → ورود به بازی 👥\n"
             "• دکمه‌های چالش، رد صحبت، رای و اقدامات شب → کنترل بازی 🎤🗳️🌙\n\n"
             "💬 بخش گفتگو\n"
-            "• «الناز» → پاسخ الناز 💖\n"
-            "• «آرسین» یا «ارسین» → پاسخ مخصوص آرسین 😤\n"
+            "• «الناز» → پاسخ الناز ✨\n"
+            "• «آرسین» یا «ارسین» → پاسخ مخصوص 😤\n"
             "• «راهنما» / «راهنما الناز» → نمایش راهنما 📚\n\n"
             "🔐 بخش ورود\n"
             "• «/start» → ثبت‌نام و بررسی عضویت 🔗\n\n"
             "🛠️ توسعه‌دهنده: @arsin_mo")
+
+@dp.callback_query(F.data=="user:daily")
+async def user_daily(query:CallbackQuery):
+    ok,st,remain,reward=claim_daily_box(query.from_user.id)
+    if not ok:
+        await query.answer(f"⏳ جایزه بعدی حدود {max(1,remain//3600)} ساعت دیگر آماده می‌شود.",show_alert=True); return
+    await query.message.edit_text(f"🎁 جعبه روزانه باز شد!\n\n💎 جایزه: {format_coins(reward)} آریور\n🔥 استریک: {st['streak']} روز",reply_markup=user_menu_keyboard()); await query.answer("🎁 جایزه گرفتی!")
+
+@dp.callback_query(F.data=="user:missions")
+async def user_missions(query:CallbackQuery):
+    rows=mission_rows(query.from_user.id)
+    text="🎯 ماموریت‌های امروز\n\n"+"\n".join(f"{'✅' if claimed else ('🟢' if progress>=target else '⬜')} {mission_label(typ)} — {progress}/{target} — 🎁 {format_coins(reward)}" for typ,target,progress,reward,claimed in rows)
+    kb=[]
+    for typ,target,progress,reward,claimed in rows:
+        if not claimed and progress>=target: kb.append([button(f"🎁 دریافت {mission_label(typ)}",f"mission:claim:{typ}")])
+    kb.append([button("🔙 برگشت به منو","user:menu")])
+    await query.message.edit_text(text,reply_markup=keyboard(kb)); await query.answer()
+
+@dp.callback_query(F.data.startswith("mission:claim:"))
+async def mission_claim(query:CallbackQuery):
+    typ=query.data.split(":",2)[2]; ok,why,reward=claim_mission(query.from_user.id,typ)
+    if not ok:
+        await query.answer("❌ هنوز کامل نشده یا قبلاً گرفته‌ای.",show_alert=True); return
+    await query.answer(f"🎁 {format_coins(reward)} آریور گرفتی!")
+    await user_missions(query)
+
+@dp.callback_query(F.data=="user:bank")
+async def user_bank(query:CallbackQuery):
+    await query.message.edit_text(f"🏦 بانک آریور\n\n💳 موجودی بانک: {format_coins(bank_balance(query.from_user.id))} آریور\n\nبرای واریز: «واریز 1000»\nبرای برداشت: «برداشت 1000»",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:shop")
+async def user_shop(query:CallbackQuery):
+    rows=[]
+    for i,(title,cost) in enumerate(SHOP_ITEMS.items(),1): rows.append([button(f"{i}. {title} — {format_coins(cost)} 💎",f"shop:buy:{i}")])
+    rows.append([button("🔙 برگشت","user:menu")])
+    await query.message.edit_text("🛍️ فروشگاه عنوان‌ها\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard(rows)); await query.answer()
+
+@dp.callback_query(F.data.startswith("shop:buy:"))
+async def shop_buy(query:CallbackQuery):
+    try: idx=int(query.data.rsplit(":",1)[1]); title=list(SHOP_ITEMS)[idx-1]
+    except Exception: await query.answer("❌ گزینه نامعتبر.",show_alert=True); return
+    ok,why,cost=buy_title(query.from_user.id,title)
+    if not ok: await query.answer("❌ قبلاً خریدی." if why=="owned" else f"❌ {format_coins(cost)} آریور لازم داری.",show_alert=True); return
+    await query.answer(f"✅ {title} خریداری شد!")
+    await user_shop(query)
+
+@dp.callback_query(F.data=="user:titles")
+async def user_titles(query:CallbackQuery):
+    titles=owned_titles(query.from_user.id)
+    text="🏷️ عنوان‌های من\n\n"+("\n".join(f"{i}. {t}" for i,t in enumerate(titles,1)) if titles else "هنوز عنوانی نداری.")
+    rows=[[button(f"فعال کردن {t}",f"title:equip:{i}")] for i,t in enumerate(titles,1)]
+    rows.append([button("🔙 برگشت","user:menu")]); await query.message.edit_text(text,reply_markup=keyboard(rows)); await query.answer()
+
+@dp.callback_query(F.data.startswith("title:equip:"))
+async def title_equip(query:CallbackQuery):
+    try: title=owned_titles(query.from_user.id)[int(query.data.rsplit(":",1)[1])-1]
+    except Exception: await query.answer("❌ عنوان نامعتبر.",show_alert=True); return
+    equip_title(query.from_user.id,title); await query.answer("🏷️ عنوان فعال شد!"); await user_titles(query)
+
+@dp.callback_query(F.data=="user:leaderboard")
+async def user_leaderboard(query:CallbackQuery):
+    rows=leaderboard(); text="🏆 رتبه‌بندی آریور\n\n"
+    for i,(uid,username,balance,level,luck,exp) in enumerate(rows,1):
+        name='@'+username if username else f'کاربر {uid}'
+        text+=f"{i}. {name} — 💎 {format_coins(balance)} — ⭐ لول {level}\n"
+    await query.message.edit_text(text or "هنوز داده‌ای نیست.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:games")
+async def user_games(query:CallbackQuery):
+    await query.message.edit_text("🎮 بازی‌های کوچک آریور\n\n🪙 شیر یا خط: «شیر یا خط 100»\n🔢 حدس عدد: «حدس عدد 7»\n\n💡 این بازی‌ها فقط با آریور داخل ربات هستند و پول واقعی در آن‌ها دخیل نیست.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:history")
+async def user_history(query:CallbackQuery):
+    rows=recent_transactions(query.from_user.id); text="📜 تاریخچه آریور\n\n"
+    for kind,amount,bal,note,ts in rows:
+        sign='+' if amount>0 else ''
+        text+=f"• {kind}: {sign}{format_coins(amount)} 💎 | موجودی {format_coins(bal)}\n"
+    await query.message.edit_text(text or "هنوز تراکنشی ثبت نشده.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:market")
+async def user_market(query:CallbackQuery):
+    rows=active_market(); text="🛒 بازار آریور\n\n"
+    kb=[]
+    for lid,seller,amount,price,created in rows:
+        name='@'+((await bot.get_chat(seller)).username or '') if False else f"کاربر {seller}"
+        text+=f"#{lid} — 💎 {format_coins(amount)} آریور با قیمت {format_coins(price)} آریور\n"
+        kb.append([button(f"🛒 خرید #{lid}",f"market:buy:{lid}")])
+    text += "\nفروش: «فروش مقدار قیمت»\nمثال: فروش 1000 1200"
+    kb += [[button("🔙 برگشت","user:menu")]]
+    await query.message.edit_text(text,reply_markup=keyboard(kb)); await query.answer()
+
+@dp.callback_query(F.data.startswith("market:buy:"))
+async def market_buy(query:CallbackQuery):
+    try: lid=int(query.data.rsplit(":",1)[1])
+    except Exception: await query.answer("❌ آگهی نامعتبر.",show_alert=True); return
+    ok,why,price,amount=buy_market_listing(query.from_user.id,lid)
+    if not ok:
+        msg={"missing":"آگهی پیدا نشد.","inactive":"آگهی قبلاً فروخته شده.","self":"نمی‌توانی آگهی خودت را بخری.","funds":f"{format_coins(price)} آریور لازم داری."}.get(why,"خرید انجام نشد.")
+        await query.answer("❌ "+msg,show_alert=True); return
+    await query.answer(f"✅ {format_coins(amount)} آریور خریدی!"); await user_market(query)
 
 @dp.callback_query(F.data=="user:menu")
 async def user_menu(query:CallbackQuery): await query.message.edit_text(profile_text(query.from_user.id),reply_markup=user_menu_keyboard()); await query.answer()
@@ -2109,6 +2437,55 @@ async def handle_text(message: Message):
         await message.answer(profile_text(message.from_user.id),reply_markup=user_menu_keyboard()); return
     if text in ("راهنما","راهنمای الناز","راهنما الناز"):
         await message.answer(user_help_text(),reply_markup=user_menu_keyboard()); return
+    if text in ("جایزه روزانه","جایزه روزانه 🎁"):
+        ok,st,remain,reward=claim_daily_box(message.from_user.id)
+        if not ok: await message.reply(f"⏳ جایزه روزانه‌ات هنوز آماده نیست؛ حدود {max(1,remain//3600)} ساعت دیگر. 🎁"); return
+        await message.reply(f"🎁 جعبه روزانه باز شد!\n💎 {format_coins(reward)} آریور گرفتی.\n🔥 استریک: {st['streak']} روز"); return
+    if text in ("استریک","استریک روزانه"):
+        st=get_daily_state(message.from_user.id); await message.reply(f"🔥 استریک روزانه: {st['streak']} روز\n🎁 جایزه جعبه روزانه با ادامه استریک بیشتر می‌شود."); return
+    if text in ("ماموریت ها","ماموریت‌ها","ماموریت"):
+        rows=mission_rows(message.from_user.id); await message.reply("🎯 ماموریت‌های امروز:\n\n"+"\n".join(f"{'✅' if claimed else '⬜'} {mission_label(typ)} — {progress}/{target} — 🎁 {format_coins(reward)}" for typ,target,progress,reward,claimed in rows)); return
+    m=re.fullmatch(r"واریز\s+([0-9,]+)",text)
+    if m:
+        amount=int(m.group(1).replace(',','')); ok,b=bank_deposit(message.from_user.id,amount); await message.reply(f"{'✅ واریز شد.' if ok else '❌ موجودی کافی نیست.'} 🏦\n💳 بانک: {format_coins(b)} آریور"); return
+    m=re.fullmatch(r"برداشت\s+([0-9,]+)",text)
+    if m:
+        amount=int(m.group(1).replace(',','')); ok,b=bank_withdraw(message.from_user.id,amount); await message.reply(f"{'✅ برداشت شد.' if ok else '❌ موجودی بانک کافی نیست.'} 🏦\n💳 بانک: {format_coins(b)} آریور"); return
+    if text in ("بانک","بانک آریور"):
+        await message.reply(f"🏦 موجودی بانک: {format_coins(bank_balance(message.from_user.id))} آریور 💎"); return
+    if text in ("فروشگاه","shop"):
+        await message.answer("🛍️ فروشگاه عنوان‌ها:\n\n"+"\n".join(f"{i}. {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1)),reply_markup=keyboard([[button(f"خرید عنوان {i}",f"shop:buy:{i}")] for i in range(1,len(SHOP_ITEMS)+1)])); return
+    m=re.fullmatch(r"خرید عنوان\s+(\d+)",text)
+    if m:
+        idx=int(m.group(1));
+        if not 1<=idx<=len(SHOP_ITEMS): await message.reply("❌ شماره عنوان نامعتبر است."); return
+        title=list(SHOP_ITEMS)[idx-1]; ok,why,cost=buy_title(message.from_user.id,title); await message.reply(f"✅ {title} خریداری شد! 💎" if ok else ("⚠️ این عنوان را داری." if why=="owned" else f"❌ {format_coins(cost)} آریور لازم داری.")); return
+    if text in ("عنوان‌های من","عنوان های من"):
+        await message.reply("🏷️ عنوان‌های من:\n\n"+("\n".join(f"{i}. {t}" for i,t in enumerate(owned_titles(message.from_user.id),1)) or "هنوز عنوانی نداری.")); return
+    m=re.fullmatch(r"عنوان\s+(\d+)",text)
+    if m:
+        titles=owned_titles(message.from_user.id); idx=int(m.group(1));
+        if not 1<=idx<=len(titles): await message.reply("❌ شماره عنوان نامعتبر است."); return
+        equip_title(message.from_user.id,titles[idx-1]); await message.reply(f"🏷️ عنوان {titles[idx-1]} فعال شد!"); return
+    if text in ("رتبه بندی","رتبه‌بندی","لیدربورد"):
+        rows=leaderboard(); await message.reply("🏆 رتبه‌بندی:\n\n"+"\n".join(f"{i}. {'@'+u if u else 'کاربر '+str(uid)} — 💎 {format_coins(b)} — ⭐ {lv}" for i,(uid,u,b,lv,l,e) in enumerate(rows,1))); return
+    if text in ("تاریخچه","تاریخچه آریور"):
+        rows=recent_transactions(message.from_user.id); await message.reply("📜 آخرین تراکنش‌ها:\n\n"+"\n".join(f"• {k}: {('+' if a>0 else '')}{format_coins(a)} 💎 | {format_coins(b)}" for k,a,b,n,t in rows) or "📜 هنوز تراکنشی نیست."); return
+    m=re.fullmatch(r"فروش\s+([0-9,]+)\s+([0-9,]+)",text)
+    if m:
+        amount=int(m.group(1).replace(',','')); price=int(m.group(2).replace(',',''))
+        ok=create_market_listing(message.from_user.id,amount,price); await message.reply("✅ آگهی بازار ثبت شد. 🛒" if ok else "❌ موجودی یا مبلغ نامعتبر است. 💎"); return
+    m=re.fullmatch(r"لغو فروش\s+(\d+)",text)
+    if m:
+        lid=int(m.group(1))
+        with db() as c:
+            row=c.execute("SELECT seller_id,amount,active FROM market WHERE listing_id=?",(lid,)).fetchone()
+            if not row or row[0]!=message.from_user.id or not row[2]: await message.reply("❌ آگهی پیدا نشد یا متعلق به شما نیست."); return
+            c.execute("UPDATE market SET active=0 WHERE listing_id=?",(lid,)); c.commit()
+        add_coins(message.from_user.id,int(row[1])); log_tx(message.from_user.id,"market_cancel",int(row[1]),f"listing={lid}")
+        await message.reply(f"✅ آگهی #{lid} لغو شد و {format_coins(row[1])} آریور برگشت خورد. 💎"); return
+    if text in ("بازار","market"):
+        rows=active_market(); await message.reply("🛒 بازار:\n\n"+"\n".join(f"#{lid} — 💎 {format_coins(amount)} آریور / قیمت {format_coins(price)}" for lid,seller,amount,price,created in rows) or "🛒 بازار خالی است."); return
     m=re.fullmatch(r"ترید\s+([0-9][0-9,]*)",text)
     if m:
         amount=int(m.group(1).replace(",","")); net,r,status=do_trade(message.from_user.id,amount)
@@ -2149,6 +2526,23 @@ async def handle_text(message: Message):
             label='@'+target.username if target.username else f'کاربر {target.id}'
             await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(state)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
 
+    # Safe in-game mini-games using Arioor only.
+    if text.startswith("شیر یا خط"):
+        parts=text.split()
+        if len(parts)!=3 or not parts[2].replace(',','').isdigit(): await message.reply("🪙 فرمت: شیر یا خط 100"); return
+        amount=int(parts[2].replace(',',''))
+        if amount<=0 or get_balance(message.from_user.id)<amount: await message.reply("❌ مبلغ معتبر نیست یا موجودی کافی نیست. 💎"); return
+        side_choice=random.choice(["شیر","خط"]); win=random.choice(["شیر","خط"])==side_choice
+        add_coins(message.from_user.id, amount if win else -amount); log_tx(message.from_user.id,"coinflip",amount if win else -amount,"شیر یا خط")
+        await message.reply(f"🪙 نتیجه: {side_choice}\n"+(f"🎉 {format_coins(amount)} آریور بردی!" if win else f"📉 {format_coins(amount)} آریور از دست دادی.")); return
+    if text.startswith("حدس عدد"):
+        parts=text.split()
+        if len(parts)!=2 or not parts[1].isdigit(): await message.reply("🔢 فرمت: حدس عدد 7"); return
+        guess=int(parts[1]); target=random.randint(1,10)
+        if not 1<=guess<=10: await message.reply("❌ عدد باید بین 1 تا 10 باشد."); return
+        reward=500 if guess==target else 0
+        if reward: add_coins(message.from_user.id,reward); log_tx(message.from_user.id,"guess",reward,"حدس عدد")
+        await message.reply(f"🔢 عدد درست: {target}\n"+(f"🎉 {format_coins(reward)} آریور جایزه گرفتی!" if reward else "😅 این بار نشد؛ دوباره امتحان کن.")); return
     if message.chat.type in ("group", "supergroup"):
         normalized = text.replace("‌", "").strip().lower()
         if "آرسین" in text or "ارسین" in text:
@@ -2213,7 +2607,7 @@ async def transfer_callback(query:CallbackQuery):
     if action=="cancel": transfer_pending.pop(sender,None); await query.message.edit_text("❌ انتقال لغو شد."); await query.answer(); return
     amount,target_id,username=pending[1:]
     if get_balance(sender)<amount: transfer_pending.pop(sender,None); await query.message.edit_text("❌ موجودی آریور کافی نیست. 💰"); await query.answer(); return
-    add_coins(sender,-amount); add_coins(target_id,amount); transfer_pending.pop(sender,None)
+    add_coins(sender,-amount); add_coins(target_id,amount); log_tx(sender,"transfer",-amount,f"to={target_id}"); log_tx(target_id,"transfer",amount,f"from={sender}"); bump_mission(sender,"transfer"); transfer_pending.pop(sender,None)
     target_label='@'+username if username else f'کاربر {target_id}'
     await query.message.edit_text(f"✅ انتقال انجام شد! 💸\n\n💰 {format_coins(amount)} آریور به {target_label} منتقل شد.\n💳 موجودی شما: {format_coins(get_balance(sender))} آریور")
     try: await bot.send_message(target_id,f"🎁 {format_coins(amount)} آریور برای شما انتقال داده شد. 💸\n💰 موجودی: {format_coins(get_balance(target_id))} آریور")
