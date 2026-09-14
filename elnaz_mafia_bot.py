@@ -117,7 +117,10 @@ def init_db():
         for name in ("ah_count", "level", "luck_level", "exp_level"):
             if name not in cols:
                 c.execute(f"ALTER TABLE coins ADD COLUMN {name} INTEGER DEFAULT 0")
-        c.execute("CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY, amount INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS gift_codes(code TEXT PRIMARY KEY, amount INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0, mode TEXT DEFAULT 'multi')")
+        gift_cols = {row[1] for row in c.execute("PRAGMA table_info(gift_codes)").fetchall()}
+        if "mode" not in gift_cols:
+            c.execute("ALTER TABLE gift_codes ADD COLUMN mode TEXT DEFAULT 'multi'")
         c.execute("CREATE TABLE IF NOT EXISTS gift_redemptions(code TEXT NOT NULL, user_id INTEGER NOT NULL, redeemed_at INTEGER NOT NULL, PRIMARY KEY(code,user_id))")
         c.commit()
 
@@ -228,32 +231,48 @@ def do_trade(user_id,amount):
 
 def active_gifts():
     with db() as c:
-        return c.execute("SELECT code,amount FROM gift_codes WHERE active=1 ORDER BY created_at DESC").fetchall()
+        return c.execute("SELECT code,amount,mode FROM gift_codes WHERE active=1 ORDER BY created_at DESC").fetchall()
 
 
-def create_gift(code, amount):
+def create_gift(code, amount, mode="multi"):
+    mode = "single" if mode == "single" else "multi"
     with db() as c:
         try:
-            c.execute("INSERT INTO gift_codes(code,amount,active,created_at) VALUES(?,?,1,?)", (code, amount, int(time.time())))
+            c.execute("INSERT INTO gift_codes(code,amount,active,created_at,mode) VALUES(?,?,1,?,?)", (code, amount, int(time.time()), mode))
             c.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
 
+def expire_gift(code):
+    with db() as c:
+        c.execute("UPDATE gift_codes SET active=0 WHERE code=?", (code.strip(),))
+        changed = c.rowcount > 0
+        c.commit()
+        return changed
+
+
 def redeem_gift(code, user_id):
     with db() as c:
-        row = c.execute("SELECT amount FROM gift_codes WHERE code=? AND active=1", (code.strip(),)).fetchone()
+        row = c.execute("SELECT amount,mode FROM gift_codes WHERE code=? AND active=1", (code.strip(),)).fetchone()
         if not row:
             return None, "invalid"
         amount = int(row[0])
+        mode = row[1] or "multi"
+
         if c.execute("SELECT 1 FROM gift_redemptions WHERE code=? AND user_id=?", (code.strip(), user_id)).fetchone():
             return amount, "used"
+
+        if mode == "single" and c.execute("SELECT 1 FROM gift_redemptions WHERE code=? LIMIT 1", (code.strip(),)).fetchone():
+            return amount, "expired"
+
         c.execute("INSERT INTO coins(user_id,balance,last_ah) VALUES(?,?,0) ON CONFLICT(user_id) DO UPDATE SET balance=balance+excluded.balance", (user_id, amount))
         c.execute("INSERT INTO gift_redemptions(code,user_id,redeemed_at) VALUES(?,?,?)", (code.strip(), user_id, int(time.time())))
+        if mode == "single":
+            c.execute("UPDATE gift_codes SET active=0 WHERE code=?", (code.strip(),))
         c.commit()
         return amount, "ok"
-
 
 
 def is_arsin_user(user):
@@ -1794,13 +1813,30 @@ async def admin_gift(query: CallbackQuery):
     if not is_arsin_user(query.from_user):
         await query.answer("فقط آرسین.", show_alert=True); return
     pending_admin[query.from_user.id] = "gift_amount"
-    await query.message.answer("تعداد آریور را ارسال کنید")
+    await query.message.answer("🎁 تعداد آریور کد هدیه را ارسال کن:")
     await query.answer()
 
 
 def gift_keyboard():
-    rows = [[button(f"{code} — {format_coins(amount)} 💎", f"gift:expire:{code}")] for code, amount in active_gifts()]
+    rows = [[button(f"{code} — {format_coins(amount)} 💎 — {'👤 تک‌کاربره' if mode == 'single' else '👥 چندکاربره'}", f"gift:expire:{code}")] for code, amount, mode in active_gifts()]
     return keyboard(rows) if rows else keyboard([[button("کد فعالی وجود ندارد", "gift:none")]])
+
+
+@dp.callback_query(F.data.startswith("giftmode:"))
+async def admin_gift_mode(query: CallbackQuery):
+    if not is_arsin_user(query.from_user):
+        await query.answer("فقط آرسین.", show_alert=True); return
+    mode = query.data.split(":", 1)[1]
+    pending = pending_admin.get(query.from_user.id)
+    if not (isinstance(pending, tuple) and pending[0] == "gift_mode"):
+        await query.answer("⏳ این درخواست منقضی شده است.", show_alert=True); return
+    if mode not in ("single", "multi"):
+        await query.answer("❌ نوع کد نامعتبر است.", show_alert=True); return
+    amount = pending[1]
+    pending_admin[query.from_user.id] = ("gift_code", amount, mode)
+    label = "تک‌کاربره 👤" if mode == "single" else "چندکاربره 👥"
+    await query.message.answer(f"✅ نوع کد: {label}\n🔑 حالا کد هدیه را وارد کن:")
+    await query.answer()
 
 
 @dp.callback_query(F.data == "admin:gifts")
@@ -1949,17 +1985,18 @@ async def handle_text(message: Message):
                 if amount <= 0: raise ValueError
             except ValueError:
                 await message.answer("❌ تعداد آریور باید عدد مثبت باشد. 🎁"); return
-            pending_admin[message.from_user.id] = ("gift_code", amount)
-            await message.answer("🔑 کد هدیه را وارد کن:")
+            pending_admin[message.from_user.id] = ("gift_mode", amount)
+            await message.answer("🎁 نوع استفاده از کد هدیه را انتخاب کن:", reply_markup=keyboard([[button("👤 تک کاربر", "giftmode:single"), button("👥 چند کاربر", "giftmode:multi")]]))
             return
         if isinstance(pending, tuple) and pending[0] == "gift_code":
             code = text
             if not code or len(code) > 100 or " " in code:
                 await message.answer("❌ کد هدیه نامعتبر است؛ بدون فاصله ارسال کن."); return
-            if not create_gift(code, pending[1]):
+            if not create_gift(code, pending[1], pending[2]):
                 await message.answer("⚠️ این کد هدیه قبلاً ثبت شده است؛ یک کد دیگر انتخاب کن."); return
             pending_admin.pop(message.from_user.id, None)
-            await message.answer(f"✅ کد هدیه {code} با هدیه {pending[1]} 💎 آریور ثبت شد.")
+            mode_label = "تک‌کاربره 👤" if pending[2] == "single" else "چندکاربره 👥"
+            await message.answer(f"✅ کد هدیه {code} با {pending[1]} 💎 آریور ثبت شد.\n🎯 نوع: {mode_label}")
             return
         if message.from_user.id in pending_link:
             state = pending_link[message.from_user.id]
@@ -2149,6 +2186,8 @@ async def handle_text(message: Message):
                 await message.reply("❌ این کد هدیه وجود ندارد یا منقضی شده است."); return
             if status == "used":
                 await message.reply("⚠️ شما قبلاً از این کد هدیه استفاده کرده‌اید."); return
+            if status == "expired":
+                await message.reply("❌ این کد هدیه تک‌کاربره قبلاً توسط یک نفر استفاده شده و دیگر قابل استفاده نیست."); return
             await message.reply(f"🎉 کد هدیه فعال شد!\n💎 {format_coins(amount)} آریور به موجودی شما اضافه شد.\n💰 موجودی شما: {format_coins(get_balance(message.from_user.id))} 💎")
             return
         if text in ("بازی مافیا", "بازی مافیا 🎭"):
