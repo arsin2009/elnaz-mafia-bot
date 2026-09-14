@@ -19,7 +19,7 @@ from aiogram.types import (
 # ================================================================
 # CONFIG
 # ================================================================
-TOKEN = "8600883204:AAFoylCruglzqgT6x61IYkUUqHWTIsHlp7c"
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required.")
 
@@ -216,7 +216,7 @@ def upgrade_stat(user_id,stat):
 
 def do_trade(user_id,amount):
     r=get_coin_row(user_id)
-    if amount not in (100,1000,10000): return None,r,"amount"
+    if amount <= 0: return None,r,"amount"
     if r["balance"]<amount: return None,r,"funds"
     win=min(80,r["luck_level"]*4+r["exp_level"]*4)
     if random.random()<win/100: net=random.randint(1,amount-1)
@@ -539,6 +539,7 @@ def new_game(message):
         "setup_message_ids": set(),
         "message_ids": set(),
         "tasks": set(),
+        "turn_token": 0,
     }
 
 
@@ -937,6 +938,8 @@ async def next_speaker(chat_id):
     await delete_message_id(chat_id, game.get("speaker_message"))
     game["speaker_message"] = None
 
+    game["turn_token"] += 1
+    turn_token = game["turn_token"]
     while game["speaker_index"] < len(game["speaker_order"]):
         user_id = game["speaker_order"][game["speaker_index"]]
         game["speaker_index"] += 1
@@ -955,17 +958,17 @@ async def next_speaker(chat_id):
             reply_markup=keyboard([[button("⚔️ چالش", f"challenge:{user_id}"),button("⏭️ رد صحبت", f"skip:{user_id}")],[timer_button(SPEAK_SECONDS,"زمان صحبت")]]),
         )
         game["speaker_message"] = sent.message_id
-        t=asyncio.create_task(speaker_timer(chat_id,user_id,SPEAK_SECONDS)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
+        t=asyncio.create_task(speaker_timer(chat_id,user_id,SPEAK_SECONDS,turn_token)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
         t=asyncio.create_task(countdown_task(chat_id,sent.message_id,game["speaker_deadline"],"day","زمان صحبت",[[button("⚔️ چالش",f"challenge:{user_id}"),button("⏭️ رد صحبت",f"skip:{user_id}")]])); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
         return
 
     await vote_round(chat_id)
 
 
-async def speaker_timer(chat_id, user_id, seconds):
+async def speaker_timer(chat_id, user_id, seconds, turn_token):
     await asyncio.sleep(seconds)
     game = games.get(chat_id)
-    if game and game.get("phase") == "day" and game.get("speaker") == user_id:
+    if game and game.get("phase") == "day" and game.get("speaker") == user_id and game.get("turn_token") == turn_token:
         game["speaker"] = None
         await delete_message_id(chat_id, game.get("speaker_message"))
         game["speaker_message"] = None
@@ -1027,11 +1030,13 @@ async def callback_challenge_yes(query: CallbackQuery):
     await delete_message_id(query.message.chat.id, game.get("challenge_message"))
     game["challenge_message"] = None
     game["speaker"] = target
+    game["turn_token"] += 1
+    challenge_token = game["turn_token"]
     game["speaker_deadline"] = now() + CHALLENGE_SECONDS
     await allow_only_speaker(query.message.chat.id, game, target)
     sent=await send_bot_message(query.message.chat.id,f"⚔️ نوبت چالش {display_user(game,target)} است! 🗣️\n⏱️ {CHALLENGE_SECONDS} ثانیه فرصت داری.",reply_markup=keyboard([[timer_button(CHALLENGE_SECONDS,"زمان چالش")]]))
     game["speaker_message"]=sent.message_id
-    t=asyncio.create_task(speaker_timer(query.message.chat.id,target,CHALLENGE_SECONDS)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
+    t=asyncio.create_task(speaker_timer(query.message.chat.id,target,CHALLENGE_SECONDS,challenge_token)); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
     t=asyncio.create_task(countdown_task(query.message.chat.id,sent.message_id,game["speaker_deadline"],"day","زمان چالش")); game["tasks"].add(t); t.add_done_callback(game["tasks"].discard)
     await query.answer()
 
@@ -1717,7 +1722,7 @@ def user_help_text():
             "• «عاح» → دریافت آریور هر ۵ دقیقه ⏰\n"
             "• «موجودی» → نمایش موجودی 💰\n"
             "• «منو» → نمایش پروفایل 👤\n"
-            "• «ترید 100» / «ترید 1000» / «ترید 10000» → ترید مستقیم 🎲\n"
+            "• «ترید مقدار» → ترید مستقیم با هر مبلغی که موجودی‌اش را داشته باشی 🎲\n"
             "• «ارتقای لول» → ارتقای لول اصلی با هزینه 10,000 آریور ⬆️\n"
             "• «ارتقای لول شانس» → افزایش شانس ترید 🍀\n"
             "• «ارتقای لول تجربه» → افزایش تجربه ترید 🧠\n"
@@ -1733,11 +1738,6 @@ def user_help_text():
             "• «راهنما» / «راهنما الناز» → نمایش راهنما 📚\n\n"
             "🔐 بخش ورود\n"
             "• «/start» → ثبت‌نام و بررسی عضویت 🔗\n\n"
-            "👑 بخش مدیریت آرسین\n"
-            "• «🔗 لینک 1 / لینک 2» → تنظیم لینک‌های عضویت 🛡️\n"
-            "• «💰 افزایش موجودی» → شارژ آریور کاربر 🎁\n"
-            "• «🎁 کد هدیه» → ساخت کد هدیه 🎟️\n"
-            "• «📋 لیست کد هدیه» → مدیریت کدهای فعال 📋\n\n"
             "🛠️ توسعه‌دهنده: @arsin_mo")
 
 @dp.callback_query(F.data=="user:menu")
@@ -2026,14 +2026,56 @@ async def handle_text(message: Message):
                 return
         return
 
+    # 👑 دستورات مستقیم مدیریت آرسین با ریپلای
+    if is_arsin:
+        admin_add = re.fullmatch(r"افزایش موجودی\s+([0-9][0-9,]*)", text)
+        admin_remove = re.fullmatch(r"شوشولشو ببر\s+([0-9][0-9,]*)", text)
+        if admin_add or admin_remove:
+            if not message.reply_to_message or not message.reply_to_message.from_user:
+                await message.reply("❌ برای این دستور باید روی پیام کاربر موردنظر ریپلای کنی. 👤↩️")
+                return
+            try:
+                amount = int((admin_add or admin_remove).group(1).replace(",", ""))
+                if amount <= 0:
+                    raise ValueError
+            except ValueError:
+                await message.reply("❌ مقدار آریور باید یک عدد مثبت باشد. 💎")
+                return
+            target = message.reply_to_message.from_user
+            if target.id == message.from_user.id:
+                await message.reply("❌ نمی‌تونی موجودی خودت رو با این دستور تغییر بدی. 👑")
+                return
+            if admin_add:
+                new_balance = add_coins(target.id, amount)
+                action_text = f"➕ {format_coins(amount)} آریور به موجودی"
+                try:
+                    await bot.send_message(target.id, f"🎁 آرسین {format_coins(amount)} آریور به موجودی شما اضافه کرد. 💎\n💰 موجودی جدید: {format_coins(new_balance)} آریور")
+                except Exception:
+                    pass
+            else:
+                current = get_balance(target.id)
+                if current < amount:
+                    await message.reply(f"❌ موجودی {label_player({'username': target.username or '', 'id': target.id})} کافی نیست. 💎\n💰 موجودی فعلی: {format_coins(current)} آریور")
+                    return
+                new_balance = add_coins(target.id, -amount)
+                action_text = f"➖ {format_coins(amount)} آریور از موجودی"
+                try:
+                    await bot.send_message(target.id, f"⚠️ آرسین {format_coins(amount)} آریور از موجودی شما کسر کرد. 💎\n💰 موجودی جدید: {format_coins(new_balance)} آریور")
+                except Exception:
+                    pass
+            target_label = f"@{target.username}" if target.username else f"کاربر {target.id}"
+            await message.reply(f"✅ {action_text} {target_label} انجام شد. 💎\n💰 موجودی جدید: {format_coins(new_balance)} آریور")
+            return
+
     # User commands work in private and group chats.
     if text in ("منو","menu"):
         await message.answer(profile_text(message.from_user.id),reply_markup=user_menu_keyboard()); return
-    if text in ("راهنما","راهنمای الناز"):
+    if text in ("راهنما","راهنمای الناز","راهنما الناز"):
         await message.answer(user_help_text(),reply_markup=user_menu_keyboard()); return
-    m=re.fullmatch(r"ترید\s+(100|1000|10000)",text)
+    m=re.fullmatch(r"ترید\s+([0-9][0-9,]*)",text)
     if m:
-        amount=int(m.group(1)); net,r,status=do_trade(message.from_user.id,amount)
+        amount=int(m.group(1).replace(",","")); net,r,status=do_trade(message.from_user.id,amount)
+        if status=="amount": await message.reply("❌ مبلغ ترید باید بیشتر از صفر باشد. 🎲💎"); return
         if status=="funds": await message.reply("❌ موجودی آریورت برای این ترید کافی نیست. 💰"); return
         result=f"🟢 {format_coins(net)} آریور سود کردی! 📈" if net>0 else f"🔴 {format_coins(abs(net))} آریور ضرر کردی. 📉"
         await message.reply(f"🎲 ترید {format_coins(amount)} آریور انجام شد!\n\n{result}\n💰 موجودی جدید: {format_coins(r['balance'])} آریور"); return
