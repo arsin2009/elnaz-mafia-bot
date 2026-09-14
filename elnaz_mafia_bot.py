@@ -117,6 +117,9 @@ def init_db():
         )
         c.execute("CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS coins(user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, last_ah INTEGER DEFAULT 0, ah_count INTEGER DEFAULT 0, level INTEGER DEFAULT 0, luck_level INTEGER DEFAULT 0, exp_level INTEGER DEFAULT 0)")
+        user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
+        if "full_name" not in user_cols:
+            c.execute("ALTER TABLE users ADD COLUMN full_name TEXT DEFAULT ''")
         cols = {row[1] for row in c.execute("PRAGMA table_info(coins)").fetchall()}
         for name in ("ah_count", "level", "luck_level", "exp_level"):
             if name not in cols:
@@ -138,18 +141,23 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS inventory(user_id INTEGER NOT NULL, item TEXT NOT NULL, quantity INTEGER DEFAULT 0, PRIMARY KEY(user_id,item))")
         c.execute("CREATE TABLE IF NOT EXISTS item_market(listing_id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id INTEGER NOT NULL, item TEXT NOT NULL, quantity INTEGER NOT NULL, price INTEGER NOT NULL, active INTEGER DEFAULT 1, created_at INTEGER DEFAULT 0)")
         c.execute("CREATE TABLE IF NOT EXISTS tournaments(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER DEFAULT 0, creator_id INTEGER NOT NULL, stake INTEGER NOT NULL, prize INTEGER DEFAULT 0, status TEXT NOT NULL, created_at INTEGER DEFAULT 0, expires_at INTEGER DEFAULT 0)")
-        c.execute("CREATE TABLE IF NOT EXISTS tournament_players(tournament_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joined_at INTEGER DEFAULT 0, PRIMARY KEY(tournament_id,user_id))")
+        c.execute("CREATE TABLE IF NOT EXISTS tournament_players(tournament_id INTEGER NOT NULL, user_id INTEGER NOT NULL, joined_at INTEGER DEFAULT 0, active INTEGER DEFAULT 1, PRIMARY KEY(tournament_id,user_id))")
+        tp_cols={row[1] for row in c.execute("PRAGMA table_info(tournament_players)").fetchall()}
+        if "active" not in tp_cols:
+            c.execute("ALTER TABLE tournament_players ADD COLUMN active INTEGER DEFAULT 1")
         c.execute("CREATE TABLE IF NOT EXISTS tournament_rounds(tournament_id INTEGER NOT NULL, round_no INTEGER NOT NULL, player_a INTEGER NOT NULL, player_b INTEGER NOT NULL, winner_id INTEGER DEFAULT 0, PRIMARY KEY(tournament_id,round_no,player_a,player_b))")
         c.execute("CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, kind TEXT NOT NULL, amount INTEGER NOT NULL, balance_after INTEGER NOT NULL, note TEXT DEFAULT '', created_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS combat_battles(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, message_id INTEGER DEFAULT 0, creator_id INTEGER NOT NULL, opponent_id INTEGER DEFAULT 0, stake INTEGER NOT NULL, status TEXT NOT NULL, creator_power INTEGER DEFAULT 0, opponent_power INTEGER DEFAULT 0, winner_id INTEGER DEFAULT 0, created_at INTEGER DEFAULT 0)")
+        c.execute("CREATE TABLE IF NOT EXISTS champions(user_id INTEGER PRIMARY KEY, titles INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, best_power INTEGER DEFAULT 0, updated_at INTEGER DEFAULT 0)")
         c.commit()
 
 
 def remember(user):
     with db() as c:
         c.execute(
-            "INSERT INTO users(id,username,started) VALUES(?,?,1) "
-            "ON CONFLICT(id) DO UPDATE SET username=excluded.username,started=1",
-            (user.id, user.username or ""),
+            "INSERT INTO users(id,username,full_name,started) VALUES(?,?,?,1) "
+            "ON CONFLICT(id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name,started=1",
+            (user.id, user.username or "", user.full_name or ""),
         )
         c.commit()
 
@@ -456,12 +464,64 @@ RANKS = [
 ]
 
 SHOP_ITEMS_V2 = {
-    "🛡️ سپر": (2500, "یک بار از یک باخت بازی شرطی جلوگیری می‌کند"),
-    "🍀 شانس ویژه": (3000, "یک بار شانس برد ترید را ۲۰٪ بیشتر می‌کند"),
-    "🎟️ بلیت بازی": (1500, "یک بلیت برای ورود نمایشی به سیستم بازی"),
+    "🛡️ سپر انرژی": (2500, "تجهیز دفاعی؛ +8 قدرت مبارزه"),
+    "🍀 شانس ویژه": (3000, "یک بار +10٪ شانس مبارزه و سپس مصرف می‌شود"),
+    "🎟️ بلیت بازی": (1500, "یک آیتم قابل معامله برای اقتصاد بازی"),
     "👑 عنوان VIP": (12000, "عنوان تزئینی VIP"),
-    "⚡ Boost XP": (4000, "یک بسته ۵۰۰ XP برای پیشرفت بازیکن"),
+    "⚡ Boost XP": (4000, "۵۰۰ XP فوری"),
+    "🔫 بلستر پلاسما": (4500, "تجهیز هجومی؛ +10 قدرت مبارزه"),
+    "💣 بمب انرژی": (5500, "تجهیز هجومی؛ +12 قدرت مبارزه"),
+    "⚔️ شمشیر انرژی": (6000, "تجهیز هجومی؛ +13 قدرت مبارزه"),
+    "🦾 زره نانو": (7000, "تجهیز دفاعی؛ +14 قدرت مبارزه"),
+    "🐺 گرگ نگهبان": (9000, "همراه مبارز؛ +16 قدرت مبارزه"),
+    "🦅 پهپاد همراه": (11000, "همراه هوشمند؛ +18 قدرت مبارزه"),
+    "🤖 ربات مبارز": (18000, "همراه ویژه؛ +28 قدرت مبارزه"),
+    "🕸️ قهرمان تارزن": (20000, "شخصیت قهرمانی خیالی؛ +30 قدرت مبارزه"),
+    "🧙 جادوگر سایه": (25000, "شخصیت قهرمانی خیالی؛ +35 قدرت مبارزه"),
 }
+
+COMBAT_POWER = {
+    "🛡️ سپر انرژی": 8,
+    "🍀 شانس ویژه": 0,
+    "🎟️ بلیت بازی": 0,
+    "👑 عنوان VIP": 0,
+    "⚡ Boost XP": 0,
+    "🔫 بلستر پلاسما": 10,
+    "💣 بمب انرژی": 12,
+    "⚔️ شمشیر انرژی": 13,
+    "🦾 زره نانو": 14,
+    "🐺 گرگ نگهبان": 16,
+    "🦅 پهپاد همراه": 18,
+    "🤖 ربات مبارز": 28,
+    "🕸️ قهرمان تارزن": 30,
+    "🧙 جادوگر سایه": 35,
+}
+
+BLACK_SHOP_ITEMS = {k:v for k,v in SHOP_ITEMS_V2.items() if k in COMBAT_POWER and COMBAT_POWER[k] > 0}
+
+def combat_power(uid):
+    with db() as c:
+        rows=c.execute("SELECT item,quantity FROM inventory WHERE user_id=? AND quantity>0",(uid,)).fetchall()
+    total=0
+    for item,qty in rows:
+        power=COMBAT_POWER.get(item,0)
+        if power:
+            total += power * min(int(qty), 10)
+    return total
+
+def combat_equipment_text(uid):
+    with db() as c:
+        rows=c.execute("SELECT item,quantity FROM inventory WHERE user_id=? AND quantity>0 ORDER BY item",(uid,)).fetchall()
+    lines=[]
+    for item,qty in rows:
+        power=COMBAT_POWER.get(item,0)
+        if power:
+            lines.append(f"{item} × {qty} — ⚔️ +{power*min(int(qty),10)}")
+        else:
+            lines.append(f"{item} × {qty} — 🎒 کاربردی")
+    total=combat_power(uid)
+    return "🎒 تجهیزات مبارزه\n\n" + ("\n".join(lines) if lines else "هنوز تجهیزاتی نداری.") + f"\n\n⚔️ قدرت کل تجهیزات: {total}"
+
 
 def ensure_player_stats(uid):
     with db() as c:
@@ -536,8 +596,13 @@ def remove_item(uid,item,qty=1):
 
 def inventory_text(uid):
     with db() as c: rows=c.execute("SELECT item,quantity FROM inventory WHERE user_id=? AND quantity>0 ORDER BY item",(uid,)).fetchall()
-    if not rows: return "🎒 کوله‌پشتی شما خالی است.\n\n🛍️ از فروشگاه آیتم بخر."
-    return "🎒 کوله‌پشتی\n\n"+"\n".join(f"{item} × {qty}" for item,qty in rows)
+    if not rows: return "🎒 کوله‌پشتی شما خالی است.\n\n🛍️ از فروشگاه آیتم یا فروشگاه سیاه خرید کن."
+    lines=[]
+    for item,qty in rows:
+        power=COMBAT_POWER.get(item,0)
+        suffix=f" — ⚔️ +{power*min(int(qty),10)} قدرت" if power else " — 🎒 کاربردی"
+        lines.append(f"{item} × {qty}{suffix}")
+    return "🎒 کوله‌پشتی و تجهیزات شما\n\n"+"\n".join(lines)+f"\n\n⚔️ قدرت کل مبارزه: {combat_power(uid)}"
 
 def shop_v2_buy(uid,item):
     if item not in SHOP_ITEMS_V2: return False,"missing",0
@@ -549,7 +614,7 @@ def shop_v2_buy(uid,item):
     return True,"ok",cost
 
 def create_item_listing(seller,item,qty,price):
-    if item not in SHOP_ITEMS_V2 or qty<=0 or price<=0 or inventory_qty(seller,item)<qty: return False
+    if not item or qty<=0 or price<=0 or inventory_qty(seller,item)<qty: return False
     if not remove_item(seller,item,qty): return False
     with db() as c: c.execute("INSERT INTO item_market(seller_id,item,quantity,price,active,created_at) VALUES(?,?,?, ?,1,?)",(seller,item,qty,price,int(time.time()))); c.commit()
     log_tx(seller,"item_market_lock",0,f"{item} x{qty} price={price}")
@@ -590,8 +655,8 @@ def tournament_create(chat_id,creator_id,stake):
     if stake<=0 or get_balance(creator_id)<stake: return None,"funds"
     add_coins(creator_id,-stake); log_tx(creator_id,"tournament_lock",-stake,"tournament")
     with db() as c:
-        cur=c.execute("INSERT INTO tournaments(chat_id,creator_id,stake,prize,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",(chat_id,creator_id,stake,stake,"waiting",int(time.time()),int(time.time())+120)); tid=cur.lastrowid
-        c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at) VALUES(?,?,?)",(tid,creator_id,int(time.time()))); c.commit()
+        cur=c.execute("INSERT INTO tournaments(chat_id,creator_id,stake,prize,status,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",(chat_id,creator_id,stake,stake,"waiting",int(time.time()),int(time.time())+TOURNAMENT_WAIT_SECONDS)); tid=cur.lastrowid
+        c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at,active) VALUES(?,?,?,1)",(tid,creator_id,int(time.time()))); c.commit()
     return tid,"ok"
 
 def tournament_get(tid):
@@ -600,8 +665,12 @@ def tournament_get(tid):
     if not r:return None
     return {"id":r[0],"chat_id":r[1],"message_id":r[2],"creator_id":r[3],"stake":r[4],"prize":r[5],"status":r[6],"created_at":r[7],"expires_at":r[8]}
 
-def tournament_players(tid):
-    with db() as c:return [r[0] for r in c.execute("SELECT user_id FROM tournament_players WHERE tournament_id=? ORDER BY joined_at",(tid,)).fetchall()]
+def tournament_players(tid,active_only=False):
+    with db() as c:
+        q="SELECT user_id FROM tournament_players WHERE tournament_id=?"
+        if active_only:q+=" AND active=1"
+        q+=" ORDER BY joined_at"
+        return [r[0] for r in c.execute(q,(tid,)).fetchall()]
 
 def tournament_join(tid,uid):
     t=tournament_get(tid)
@@ -614,35 +683,50 @@ def tournament_join(tid,uid):
     if get_balance(uid)<t["stake"]:return t,"funds"
     add_coins(uid,-t["stake"]); log_tx(uid,"tournament_lock",-t["stake"],f"tid={tid}")
     with db() as c:
-        c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at) VALUES(?,?,?)",(tid,uid,int(time.time())))
+        c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at,active) VALUES(?,?,?,1)",(tid,uid,int(time.time())))
         c.execute("UPDATE tournaments SET prize=prize+? WHERE id=?",(t["stake"],tid)); c.commit()
     return tournament_get(tid),"ok"
 
+def champion_record(uid):
+    with db() as c:
+        r=c.execute("SELECT titles,wins,best_power FROM champions WHERE user_id=?",(uid,)).fetchone()
+    return {"titles":int(r[0]),"wins":int(r[1]),"best_power":int(r[2])} if r else {"titles":0,"wins":0,"best_power":0}
+
+def award_champion(uid,power):
+    with db() as c:
+        c.execute("INSERT INTO champions(user_id,titles,wins,best_power,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET titles=titles+1,wins=wins+1,best_power=MAX(best_power,excluded.best_power),updated_at=excluded.updated_at",(uid,1,1,power,int(time.time()))); c.commit()
+
+def tournament_match_winner(a,b):
+    pa,pb=combat_power(a),combat_power(b)
+    diff=pa-pb
+    chance=max(15,min(85,50+diff*2))
+    return (a if random.random()<chance/100 else b),pa,pb,chance
+
 def tournament_round(tid):
-    t=tournament_get(tid); ps=tournament_players(tid)
+    t=tournament_get(tid)
     if not t:return None
-    if len(ps)<=1:return ("final",ps[0],t["prize"]) if ps else None
-    rnd=1
+    ps=tournament_players(tid,active_only=True)
+    if len(ps)==1:
+        winner=ps[0]
+        if t["status"]!="finished":
+            with db() as c:c.execute("UPDATE tournaments SET status='finished' WHERE id=?",(tid,)); c.commit()
+            add_coins(winner,t["prize"]); log_tx(winner,"tournament_win",t["prize"],f"tid={tid}")
+            award_champion(winner,combat_power(winner)); record_game(winner,"win",t["prize"],"tournament")
+            for u in tournament_players(tid):
+                if u!=winner: record_game(u,"loss",0,"tournament")
+        return ("final",winner,t["prize"],[])
     with db() as c:
         r=c.execute("SELECT COALESCE(MAX(round_no),0) FROM tournament_rounds WHERE tournament_id=?",(tid,)).fetchone(); rnd=int(r[0])+1
-    random.shuffle(ps); results=[]; winners=[]
-    for i in range(0,len(ps),2):
-        a=ps[i]; b=ps[i+1]
-        w=random.choice([a,b]); l=b if w==a else a
-        winners.append(w); results.append((a,b,w,l))
-        with db() as c:c.execute("INSERT INTO tournament_rounds(tournament_id,round_no,player_a,player_b,winner_id) VALUES(?,?,?,?,?)",(tid,rnd,a,b,w)); c.commit()
-    if len(winners)==1:
-        with db() as c:c.execute("UPDATE tournaments SET status='finished' WHERE id=?",(tid,)); c.commit()
-        add_coins(winners[0],t["prize"]); log_tx(winners[0],"tournament_win",t["prize"],f"tid={tid}")
-        record_game(winners[0],"win",t["prize"],"tournament")
-        for u in ps:
-            if u!=winners[0]: record_game(u,"loss",0,"tournament")
-        return ("final",winners[0],t["prize"],results)
-    # Persist survivors for next round in a temporary status table by rewriting players.
-    with db() as c:
-        c.execute("DELETE FROM tournament_players WHERE tournament_id=?",(tid,))
-        for u in winners:c.execute("INSERT INTO tournament_players(tournament_id,user_id,joined_at) VALUES(?,?,?)",(tid,u,int(time.time())))
-        c.commit()
+    results=[]; winners=[]
+    for i in range(0,len(ps)-1,2):
+        a,b=ps[i],ps[i+1]
+        w,pa,pb,chance=tournament_match_winner(a,b); l=b if w==a else a
+        winners.append(w); results.append((a,b,w,l,pa,pb,chance))
+        with db() as c:
+            c.execute("INSERT INTO tournament_rounds(tournament_id,round_no,player_a,player_b,winner_id) VALUES(?,?,?,?,?)",(tid,rnd,a,b,w))
+            c.execute("UPDATE tournament_players SET active=0 WHERE tournament_id=? AND user_id=?",(tid,l)); c.commit()
+    if len(ps)%2==1:
+        bye=ps[-1]; winners.append(bye); results.append((bye,None,bye,None,combat_power(bye),0,100))
     return ("round",rnd,winners,results)
 
 TOURNAMENT_WAIT_SECONDS=120
@@ -797,69 +881,56 @@ async def start_wager_game(w):
     gid=w["id"]; chat_id=w["chat_id"]; creator=w["creator_id"]; opponent=w["opponent_id"]; stake=w["stake"]
     name=WAGER_GAME_NAMES.get(w["game_type"],w["game_type"])
     if w["game_type"]=="dooz":
-        wager_games[gid]["board"]=[""]*9
-        wager_games[gid]["turn"]=creator
-        await send_bot_message(chat_id, f"⭕️❌ دوز شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nنوبت {display_name_by_id(creator)} است.",
-                                reply_markup=dooz_keyboard(gid))
-
-    if w["game_type"]=="rps":
+        wager_games[gid]["board"]=[""]*9; wager_games[gid]["turn"]=creator
+        await send_bot_message(chat_id,f"⭕️❌ دوز شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nنوبت {display_name_by_id(creator)} است.",reply_markup=dooz_keyboard(gid))
+    elif w["game_type"]=="rps":
         wager_games[gid]["choices"]={}
-        await send_bot_message(chat_id, f"✊✋✌️ {name} شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n👥 بازیکنان: @{'' if not creator else ''}\n\nهر دو بازیکن انتخاب خود را بزنند.",
-                                reply_markup=keyboard([
-                                    [button("✊ سنگ",f"wager:rps:{gid}:rock"),button("📄 کاغذ",f"wager:rps:{gid}:paper"),button("✂️ قیچی",f"wager:rps:{gid}:scissors")]
-                                ]))
-    elif w["game_type"]=="cards":
-        a=random.randint(1,13); b=random.randint(1,13)
-        winner=creator if a>b else opponent if b>a else None
-        finish_wager(gid,winner,draw=winner is None)
-        await send_bot_message(chat_id, f"🃏 جنگ کارت تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n"+(f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی شد؛ ورودی هر دو نفر برگشت."))
+        await send_bot_message(chat_id,f"✊✋✌️ {name} شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n👥 {display_name_by_id(creator)} × {display_name_by_id(opponent)}\n\nهر دو بازیکن انتخاب خود را بزنند.",reply_markup=keyboard([[button("✊ سنگ",f"wager:rps:{gid}:rock"),button("📄 کاغذ",f"wager:rps:{gid}:paper"),button("✂️ قیچی",f"wager:rps:{gid}:scissors")]]))
     elif w["game_type"]=="evenodd":
         wager_games[gid]["choices"]={}
-        await send_bot_message(chat_id, f"🎯 زوج یا فرد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nهر بازیکن انتخاب خودش را بزند.",
-                                reply_markup=keyboard([[button("🔵 زوج",f"wager:evenodd:{gid}:even"),button("🟣 فرد",f"wager:evenodd:{gid}:odd")]]))
+        await send_bot_message(chat_id,f"🎯 زوج یا فرد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nهر بازیکن انتخاب خودش را بزند.",reply_markup=keyboard([[button("🔵 زوج",f"wager:evenodd:{gid}:even"),button("🟣 فرد",f"wager:evenodd:{gid}:odd")]]))
     elif w["game_type"]=="guess":
-        wager_games[gid]["guess"]={}
-        await send_bot_message(chat_id, f"🔢 حدس عدد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nبازیکن دوم باید عدد ۱ تا ۱۰ را حدس بزند.",
-                                reply_markup=keyboard([[button(str(i),f"wager:guess:{gid}:{i}") for i in range(1,6)],
-                                                       [button(str(i),f"wager:guess:{gid}:{i}") for i in range(6,11)]]))
-    elif w["game_type"]=="dice":
-        a=random.randint(1,6); b=random.randint(1,6)
-        winner=creator if a>b else opponent if b>a else None
-        finish_wager(gid,winner,draw=winner is None)
-        await send_bot_message(chat_id, f"🎲 تاس جنگ تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n" + (f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی؛ ورودی‌ها برگشت."))
+        wager_games[gid]["target"]=None
+        await send_bot_message(chat_id,f"🔢 حدس عدد شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\n🎯 اول {display_name_by_id(creator)} یک عدد مخفی بین ۱ تا ۱۰ انتخاب کند.",reply_markup=keyboard([[button(str(i),f"wager:guess:{gid}:secret:{i}") for i in range(1,6)],[button(str(i),f"wager:guess:{gid}:secret:{i}") for i in range(6,11)]]))
+    elif w["game_type"] in ("cards","dice","higher"):
+        w["rolls"]={}; action={"cards":"🃏 کارت بکش","dice":"🎲 تاس بنداز","higher":"📈 عدد بگیر"}[w["game_type"]]
+        await send_bot_message(chat_id,f"{action} — {name} شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nهر دو بازیکن روی دکمه بزنند.",reply_markup=keyboard([[button(action,f"wager:draw:{gid}")]]))
     elif w["game_type"]=="coinflip":
-        result=random.choice(["شیر","خط"])
-        winner=creator if result=="شیر" else opponent
-        finish_wager(gid,winner)
-        await send_bot_message(chat_id, f"🪙 شیر یا خط دو نفره\n\n🎲 نتیجه: {result}\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور")
+        w["coin_choice"]=None
+        await send_bot_message(chat_id,f"🪙 شیر یا خط دو نفره\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\n{display_name_by_id(creator)} انتخاب کند:",reply_markup=keyboard([[button("🦁 شیر",f"wager:coin:{gid}:heads"),button("🪙 خط",f"wager:coin:{gid}:tails")]]))
     elif w["game_type"]=="blackjack":
-        a=random.randint(16,21); b=random.randint(16,21)
-        winner=creator if a>b else opponent if b>a else None
-        finish_wager(gid,winner,draw=winner is None)
-        await send_bot_message(chat_id, f"🃏 بلک‌جک ساده تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n" + (f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی؛ ورودی‌ها برگشت."))
+        deck=[1,2,3,4,5,6,7,8,9,10,10,10,10]*4; random.shuffle(deck)
+        w["deck"]=deck; w["hands"]={creator:[deck.pop(),deck.pop()],opponent:[deck.pop(),deck.pop()]}; w["stood"]={creator:False,opponent:False}; w["bj_turn"]=creator
+        await send_bot_message(chat_id,f"🃏 بلک‌جک شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\nنوبت {display_name_by_id(creator)} است.\nدست شما: {sum(w['hands'][creator])}",reply_markup=keyboard([[button("🃏 کارت بگیر",f"wager:blackjack:{gid}:hit"),button("✋ ایست",f"wager:blackjack:{gid}:stand")]]))
     elif w["game_type"]=="quickmath":
-        a=random.randint(2,20); b=random.randint(2,20); op=random.choice(["+","-","×"])
-        ans=a+b if op=="+" else a-b if op=="-" else a*b
-        winner=random.choice([creator,opponent]); finish_wager(gid,winner)
-        await send_bot_message(chat_id, f"⚡ مسابقه سرعت\n🧠 سوال: {a} {op} {b} = {ans}\n🏆 برنده سرعت: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور")
-    elif w["game_type"]=="higher":
-        a=random.randint(1,100); b=random.randint(1,100)
-        winner=creator if a>b else opponent if b>a else None
-        finish_wager(gid,winner,draw=winner is None)
-        await send_bot_message(chat_id, f"📈 بازی بالاتر تمام شد!\n\n👤 بازیکن اول: {a}\n👤 بازیکن دوم: {b}\n\n"+(f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(stake*2)} آریور" if winner else "🤝 مساوی شد؛ ورودی هر دو نفر برگشت."))
+        a=random.randint(2,20); b=random.randint(2,20); op=random.choice(["+","-","×"]); ans=a+b if op=="+" else a-b if op=="-" else a*b
+        choices={ans,ans+random.choice([-3,-2,-1,1,2,3]),ans+random.choice([-5,-4,4,5]),ans+random.choice([-7,-6,6,7])}
+        while len(choices)<4: choices.add(ans+random.randint(-10,10))
+        choices=list(choices); random.shuffle(choices); w["math_answer"]=ans; w["math_started"]=time.time()
+        await send_bot_message(chat_id,f"⚡ مسابقه سرعت شروع شد!\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n\n🧠 سریع‌ترین جواب درست برنده است:\n\n{a} {op} {b} = ؟",reply_markup=keyboard([[button(str(x),f"wager:quickmath:{gid}:{x}") for x in choices[:2]],[button(str(x),f"wager:quickmath:{gid}:{x}") for x in choices[2:]]]))
+        asyncio.create_task(quickmath_timeout(gid))
+
+async def quickmath_timeout(gid):
+    await asyncio.sleep(20)
+    w=wager_games.get(gid)
+    if not w or w.get("status")!="active" or "math_answer" not in w:return
+    finish_wager(gid,draw=True)
+    try: await bot.send_message(w["chat_id"],"⏰ زمان مسابقه سرعت تمام شد؛ هیچ پاسخ درستی ثبت نشد.\n🤝 ورودی هر دو نفر برگشت.")
+    except Exception:pass
 
 def display_name_by_id(user_id):
     try:
         row=get_user_record(user_id)
         if row:
-            return "@"+row[1] if row[1] else "بازیکن"
+            if row[1]: return "@"+row[1]
+            if row[2]: return row[2]
     except Exception:
         pass
     return "بازیکن"
 
 def get_user_record(user_id):
     with db() as c:
-        return c.execute("SELECT id,username FROM users WHERE id=?", (user_id,)).fetchone()
+        return c.execute("SELECT id,username,full_name FROM users WHERE id=?", (user_id,)).fetchone()
 
 def active_gifts():
     with db() as c:
@@ -1016,11 +1087,11 @@ async def mute_all_alive(chat_id, game):
 def label_player(player):
     if player.get("username"):
         return f'@{player["username"]}'
-    return f'کاربر {player["id"]}'
+    return ("@"+player["username"]) if player.get("username") else (player.get("full_name") or "بازیکن")
 
 def display_user(game,user_id):
     p=get_player(game,user_id)
-    return label_player(p) if p else f'کاربر {user_id}'
+    return label_player(p) if p else 'بازیکن'
 
 
 def check_win(game):
@@ -1647,7 +1718,7 @@ async def callback_challenge(query: CallbackQuery):
 
     sent = await send_bot_message(
         query.message.chat.id,
-        f"کاربر {challenger} چالش میخاد؛ چالش بهش میدی؟",
+        f"{display_name_by_id(challenger)} چالش می‌خواد؛ قبول می‌کنی؟",
         reply_markup=keyboard(
             [
                 [
@@ -2383,7 +2454,8 @@ def profile_text(uid):
     r=get_coin_row(uid); win=min(80,r["luck_level"]*4+r["exp_level"]*4)
     title=current_title(uid) or "بدون عنوان"
     st=get_daily_state(uid)
-    return (f"👤 منوی کاربر الناز ✨\n\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n🏦 بانک: {format_coins(bank_balance(uid))} آریور\n🏷️ عنوان: {title}\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}\n🔥 استریک روزانه: {st['streak']}")
+    display=display_name_by_id(uid)
+    return (f"👤 منوی کاربر الناز ✨\n\n🪪 این منو متعلق به: {display}\n\n💰 موجودی آریور: {format_coins(r['balance'])} آریور\n🏦 بانک: {format_coins(bank_balance(uid))} آریور\n🏷️ عنوان: {title}\n⭐ لول کاربر: {r['level']}\n🍀 لول شانس: {r['luck_level']}/10 ({r['luck_level']*4}% شانس برد)\n🧠 لول تجربه: {r['exp_level']}/10 ({r['exp_level']*4}% شانس برد)\n🎯 شانس برد ترید: {win}%\n🔥 تعداد عاح: {r['ah_count']}\n🔥 استریک روزانه: {st['streak']}\n⚔️ قدرت تجهیزات: {combat_power(uid)}")
 
 def user_menu_keyboard():
     return keyboard([
@@ -2395,7 +2467,8 @@ def user_menu_keyboard():
         [button("🏆 رتبه‌بندی","user:leaderboard"),button("🥇 رنک و لیگ","user:rank")],
         [button("🏷️ عنوان‌های من","user:titles"),button("🎒 کوله‌پشتی","user:inventory")],
         [button("🛒 بازار","user:market"),button("🎮 بازی‌ها","user:games")],
-        [button("🏆 تورنمنت","user:tournament")],
+        [button("🕶️ فروشگاه سیاه","user:blackshop"),button("🥊 مبارزه","user:combat")],
+        [button("🏆 تورنمنت","user:tournament"),button("👑 قهرمان","user:champion")],
         [button("📜 تاریخچه","user:history")],
         [button("💸 انتقال آریور","user:transfer")],[button("📚 راهنما","user:help")]
     ])
@@ -2432,8 +2505,11 @@ def user_help_text():
             "• «فروشگاه» → عنوان‌ها و آیتم‌های کاربردی\n"
             "• «خرید عنوان شماره» → خرید عنوان 🏷️\n"
             "• «عنوان‌های من» → مشاهده و فعال‌سازی عنوان‌ها\n"
-            "• «آیتم‌ها» → مشاهده کوله‌پشتی 🎒\n"
-            "• آیتم‌های کاربردی: 🛡️ سپر، 🍀 شانس ویژه، 🎟️ بلیت بازی، 👑 عنوان VIP، ⚡ Boost XP\n\n"
+            "• «آیتم‌ها» → مشاهده کوله‌پشتی و قدرت تجهیزات 🎒\n"
+            "• «فروشگاه سیاه» → تجهیزات مبارزه و شخصیت‌های خیالی ⚔️\n"
+            "• «مبارزه 1000» → مبارزه دو نفره؛ قدرت تجهیزات روی شانس برد اثر می‌گذارد 🥊\n"
+            "• 🛡️ سپر در مبارزه می‌تواند یک شکست را خنثی کند و 🍀 شانس ویژه یک‌بار +10٪ می‌دهد.\n"
+            "• همه تجهیزات خریداری‌شده در «آیتم‌ها» با تعداد و قدرتشان نمایش داده می‌شوند. 🎒\n\n"
             "🛒 بازار بازیکنان\n"
             "• «بازار» → بازار آریور\n"
             "• «فروش مقدار قیمت» → فروش آریور\n"
@@ -2451,7 +2527,8 @@ def user_help_text():
             "• «تاس جنگ 100» → تاس بالاتر برنده است\n"
             "• «شیر یا خط دو نفره 100» → نتیجه شیر/خط\n"
             "• «بلک‌جک ساده 100» → عدد نزدیک‌تر به ۲۱\n"
-            "• «مسابقه سرعت 100» → چالش سرعت\n"
+            "• «مسابقه سرعت 100» → اولین پاسخ درست برنده می‌شود ⚡\n"
+            "• «مبارزه 1000» → مبارزه دو نفره با تأثیر مستقیم تجهیزات بر شانس برد 🥊\n"
             "💎 مبلغ ورودی هر دو نفر برابر است؛ برنده کل مبلغ دو ورودی را می‌گیرد. اگر بازی مساوی شود، ورودی هر دو نفر برمی‌گردد. اگر دعوت تا ۶۰ ثانیه بدون شرکت بماند، مبلغ سازنده خودکار برمی‌گردد.\n\n"
             "🏆 تورنمنت\n"
             "• «تورنمنت 1000» → ساخت تورنمنت ۸ نفره در گروه\n"
@@ -2591,26 +2668,157 @@ async def wager_evenodd_callback(query: CallbackQuery):
 @dp.callback_query(F.data.startswith("wager:guess:"))
 async def wager_guess_callback(query: CallbackQuery):
     parts=query.data.split(":")
-    try: wid=int(parts[2]); guess=int(parts[3])
-    except Exception:
-        await query.answer("❌ حدس نامعتبر.",show_alert=True); return
+    try: wid=int(parts[2])
+    except Exception: await query.answer("❌ بازی نامعتبر است.",show_alert=True); return
     w=wager_games.get(wid)
-    if not w or w.get("status")!="active":
-        await query.answer("❌ بازی فعال نیست.",show_alert=True); return
-    if query.from_user.id != w["opponent_id"]:
-        await query.answer("🎯 فقط بازیکن دوم حدس می‌زند.",show_alert=True); return
-    target=random.randint(1,10)
-    if guess==target:
-        winner=w["opponent_id"]
-        finish_wager(wid,winner)
-        text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
-    else:
-        winner=w["creator_id"]
-        finish_wager(wid,winner)
-        text=f"🎯 عدد درست: {target}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"
+    if not w or w.get("status")!="active": await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if len(parts)>=5 and parts[3]=="secret":
+        value=int(parts[4])
+        if query.from_user.id!=w["creator_id"]: await query.answer("🎯 فقط سازنده عدد مخفی را انتخاب می‌کند.",show_alert=True); return
+        if w.get("target") is not None: await query.answer("⚠️ عدد مخفی قبلاً انتخاب شده.",show_alert=True); return
+        w["target"]=value
+        await query.message.edit_text(f"🔢 عدد مخفی ثبت شد!\n\n🎯 {display_name_by_id(w['opponent_id'])} حالا حدس بزند.",reply_markup=keyboard([[button(str(i),f"wager:guess:{wid}:try:{i}") for i in range(1,6)],[button(str(i),f"wager:guess:{wid}:try:{i}") for i in range(6,11)]]))
+        await query.answer("✅ ثبت شد")
+        return
+    if len(parts)>=5 and parts[3]=="try":
+        guess=int(parts[4])
+        if query.from_user.id!=w["opponent_id"]: await query.answer("🎯 فقط بازیکن دوم حدس می‌زند.",show_alert=True); return
+        if w.get("target") is None: await query.answer("⏳ هنوز عدد مخفی انتخاب نشده.",show_alert=True); return
+        winner=w["opponent_id"] if guess==w["target"] else w["creator_id"]
+        target=w["target"]; finish_wager(wid,winner)
+        await query.message.edit_text(f"🔢 عدد مخفی: {target}\n🎯 حدس بازیکن دوم: {guess}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")
+        await query.answer()
+
+
+@dp.callback_query(F.data.startswith("wager:draw:"))
+async def wager_draw_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2])
+    except Exception: await query.answer("❌ بازی نامعتبر است.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active" or query.from_user.id not in (w["creator_id"],w["opponent_id"]): await query.answer("❌ این بازی برای شما فعال نیست.",show_alert=True); return
+    rolls=w.setdefault("rolls",{})
+    if query.from_user.id in rolls: await query.answer("⚠️ انتخابت قبلاً ثبت شده.",show_alert=True); return
+    typ=w["game_type"]; rolls[query.from_user.id]=random.randint(1,13) if typ=="cards" else random.randint(1,6) if typ=="dice" else random.randint(1,100)
+    await query.answer("✅ ثبت شد")
+    if len(rolls)<2: return
+    a,b=rolls[w["creator_id"]],rolls[w["opponent_id"]]
+    winner=w["creator_id"] if a>b else w["opponent_id"] if b>a else None
+    finish_wager(wid,winner,draw=winner is None)
+    unit="کارت" if typ=="cards" else "تاس" if typ=="dice" else "عدد"
+    text=f"{unit}‌ها: {a} مقابل {b}\n\n" + ("🤝 مساوی شد؛ ورودی‌ها برگشت." if winner is None else f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")
     await query.message.edit_text(text)
+
+@dp.callback_query(F.data.startswith("wager:coin:"))
+async def wager_coin_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); choice=parts[3]
+    except Exception: await query.answer("❌ انتخاب نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active": await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if query.from_user.id!=w["creator_id"]: await query.answer("🎯 فقط سازنده سمت سکه را انتخاب می‌کند.",show_alert=True); return
+    if w.get("coin_choice"): await query.answer("⚠️ انتخاب قبلاً ثبت شده.",show_alert=True); return
+    w["coin_choice"]=choice
+    await query.message.edit_text(f"🪙 سمت سکه انتخاب شد.\n\n{display_name_by_id(w['opponent_id'])} برای انداختن سکه دکمه را بزند.",reply_markup=keyboard([[button("🪙 انداختن سکه",f"wager:coinflip:{wid}")]]))
+    await query.answer("✅ ثبت شد")
+
+@dp.callback_query(F.data.startswith("wager:coinflip:"))
+async def wager_coinflip_callback(query: CallbackQuery):
+    try: wid=int(query.data.rsplit(":",1)[1])
+    except Exception: await query.answer("❌ بازی نامعتبر است.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active" or query.from_user.id!=w["opponent_id"]: await query.answer("❌ فقط بازیکن دوم می‌تواند سکه را بیندازد.",show_alert=True); return
+    result=random.choice(["heads","tails"]); winner=w["creator_id"] if result==w["coin_choice"] else w["opponent_id"]
+    finish_wager(wid,winner)
+    label="🦁 شیر" if result=="heads" else "🪙 خط"
+    await query.message.edit_text(f"🪙 نتیجه: {label}\n\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")
     await query.answer()
 
+@dp.callback_query(F.data.startswith("wager:blackjack:"))
+async def wager_blackjack_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); action=parts[3]
+    except Exception: await query.answer("❌ حرکت نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active": await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    uid=query.from_user.id
+    if uid!=w.get("bj_turn"): await query.answer("⏳ الان نوبت شما نیست.",show_alert=True); return
+    hand=w["hands"][uid]; total=sum(hand)
+    if action=="hit":
+        if not w["deck"]: w["deck"]= [1,2,3,4,5,6,7,8,9,10,10,10,10]*4; random.shuffle(w["deck"])
+        hand.append(w["deck"].pop()); total=sum(hand)
+        if total>21:
+            winner=w["opponent_id"] if uid==w["creator_id"] else w["creator_id"]; finish_wager(wid,winner)
+            await query.message.edit_text(f"🃏 {display_name_by_id(uid)} از ۲۱ عبور کرد.\n🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور"); await query.answer(); return
+        await query.message.edit_text(f"🃏 نوبت {display_name_by_id(uid)}\n🎴 دست: {total}",reply_markup=keyboard([[button("🃏 کارت بگیر",f"wager:blackjack:{wid}:hit"),button("✋ ایست",f"wager:blackjack:{wid}:stand")]])); await query.answer(); return
+    w["stood"][uid]=True
+    other=w["opponent_id"] if uid==w["creator_id"] else w["creator_id"]
+    if w["stood"].get(other):
+        a=sum(w["hands"][w["creator_id"]]); b=sum(w["hands"][w["opponent_id"]]); winner=w["creator_id"] if a>b else w["opponent_id"] if b>a else None
+        finish_wager(wid,winner,draw=winner is None)
+        await query.message.edit_text(f"🃏 پایان بلک‌جک\n👤 {display_name_by_id(w['creator_id'])}: {a}\n👤 {display_name_by_id(w['opponent_id'])}: {b}\n\n"+("🤝 مساوی؛ ورودی‌ها برگشت." if winner is None else f"🏆 برنده: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")); await query.answer(); return
+    w["bj_turn"]=other
+    await query.message.edit_text(f"🃏 نوبت {display_name_by_id(other)}\n🎴 دست فعلی: {sum(w['hands'][other])}",reply_markup=keyboard([[button("🃏 کارت بگیر",f"wager:blackjack:{wid}:hit"),button("✋ ایست",f"wager:blackjack:{wid}:stand")]])); await query.answer()
+
+@dp.callback_query(F.data.startswith("wager:quickmath:"))
+async def wager_quickmath_callback(query: CallbackQuery):
+    parts=query.data.split(":")
+    try: wid=int(parts[2]); answer=int(parts[3])
+    except Exception: await query.answer("❌ پاسخ نامعتبر.",show_alert=True); return
+    w=wager_games.get(wid)
+    if not w or w.get("status")!="active": await query.answer("❌ بازی فعال نیست.",show_alert=True); return
+    if answer!=w.get("math_answer"):
+        await query.answer("❌ جواب اشتباهه! سریع‌تر دوباره امتحان کن.",show_alert=True); return
+    winner=query.from_user.id
+    if winner not in (w["creator_id"],w["opponent_id"]): await query.answer("❌ شما بازیکن این بازی نیستی.",show_alert=True); return
+    elapsed=max(0,time.time()-w.get("math_started",time.time())); finish_wager(wid,winner)
+    await query.message.edit_text(f"⚡ پاسخ درست ثبت شد!\n⏱️ زمان پاسخ: {elapsed:.2f} ثانیه\n🏆 برنده سرعت: {display_name_by_id(winner)}\n💎 جایزه: {format_coins(w['stake']*2)} آریور")
+    await query.answer("🏆 بردی!")
+
+@dp.callback_query(F.data.startswith("combat:join:"))
+async def combat_join_callback(query: CallbackQuery):
+    try: bid=int(query.data.rsplit(":",1)[1])
+    except Exception: await query.answer("❌ مبارزه نامعتبر است.",show_alert=True); return
+    b,status=combat_join(bid,query.from_user.id)
+    if status=="missing": await query.answer("❌ مبارزه پیدا نشد.",show_alert=True); return
+    if status=="closed": await query.answer("❌ این مبارزه دیگر فعال نیست.",show_alert=True); return
+    if status=="self": await query.answer("😄 خودت سازنده‌ای؛ نفر دوم باید شرکت کند.",show_alert=True); return
+    if status=="funds": await query.answer("❌ موجودی آریورت برای ورود کافی نیست.",show_alert=True); return
+    result=resolve_combat(bid)
+    if not result: await query.answer("❌ خطا در اجرای مبارزه.",show_alert=True); return
+    await query.answer("🥊 مبارزه انجام شد!")
+    cp,op=result["creator_power"],result["opponent_power"]
+    if result["winner"] is None:
+        text=(f"🥊 نتیجه مبارزه\n\n👤 {display_name_by_id(b['creator_id'])}: ⚔️ {cp} قدرت\n👤 {display_name_by_id(b['opponent_id'])}: ⚔️ {op} قدرت\n\n"
+              f"🛡️ سپر فعال شد و شکست را خنثی کرد!\n🤝 هر دو ورودی {format_coins(b['stake'])} آریور برگشت.")
+    else:
+        wc=display_name_by_id(result["winner"])
+        text=(f"🥊 نتیجه مبارزه\n\n👤 {display_name_by_id(b['creator_id'])}: ⚔️ {cp} قدرت\n👤 {display_name_by_id(b['opponent_id'])}: ⚔️ {op} قدرت\n\n"
+              f"📊 شانس {display_name_by_id(b['creator_id'])}: {result['creator_chance']:.1f}%\n"
+              f"🏆 برنده: {wc}\n💎 جایزه: {format_coins(result['pot'])} آریور\n"
+              f"🍀 شانس ویژه مصرف‌شده: {result['bonus_creator']+result['bonus_opponent']}٪")
+    await query.message.edit_text(text)
+
+@dp.callback_query(F.data=="user:blackshop")
+async def user_blackshop(query: CallbackQuery):
+    await query.message.edit_text(black_shop_text(),reply_markup=black_shop_keyboard()); await query.answer()
+
+@dp.callback_query(F.data=="user:combat")
+async def user_combat(query: CallbackQuery):
+    await query.message.edit_text("🥊 مبارزه دو نفره ⚔️\n\nفرمت ساخت مبارزه در گروه: «مبارزه 1000»\n👥 نفر دوم روی «شرکت کردن» می‌زند.\n⚔️ قدرت تجهیزات هر دو نفر محاسبه می‌شود و هرچه تجهیزات قوی‌تر باشد، شانس برد بیشتر است.\n🍀 «شانس ویژه» در مبارزه یک‌بار مصرف است و +10٪ شانس می‌دهد.\n💎 برنده کل دو ورودی را می‌گیرد؛ اگر دعوت تا ۶۰ ثانیه بدون شرکت بماند، پول سازنده برمی‌گردد.",reply_markup=keyboard([[button("🕶️ فروشگاه سیاه","user:blackshop")],[button("🎒 تجهیزات من","user:inventory")],[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data=="user:champion")
+async def user_champion(query: CallbackQuery):
+    ch=champion_record(query.from_user.id)
+    await query.message.edit_text(f"👑 سیستم قهرمان\n\n👤 {display_name_by_id(query.from_user.id)}\n🏆 قهرمانی‌ها: {ch['titles']}\n⚔️ بردهای ثبت‌شده: {ch['wins']}\n💪 بیشترین قدرت ثبت‌شده: {ch['best_power']}\n\nبا قهرمانی در تورنمنت، رکورد قهرمانی شما افزایش پیدا می‌کند. 🔥",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+
+@dp.callback_query(F.data.startswith("blackshop:buy:"))
+async def blackshop_buy_callback(query: CallbackQuery):
+    try: idx=int(query.data.rsplit(":",1)[1]); item=list(BLACK_SHOP_ITEMS)[idx-1]
+    except Exception: await query.answer("❌ آیتم نامعتبر است.",show_alert=True); return
+    ok,why,cost=shop_v2_buy(query.from_user.id,item)
+    if not ok: await query.answer(f"❌ {format_coins(cost)} آریور لازم داری.",show_alert=True); return
+    await query.answer(f"✅ {item} خریداری شد! ⚔️"); await user_blackshop(query)
 
 @dp.callback_query(F.data=="user:rank")
 async def user_rank(query:CallbackQuery):
@@ -2654,10 +2862,10 @@ async def tournament_join_callback(query:CallbackQuery):
         await bot.send_message(t["chat_id"],f"🏆 تورنمنت #{tid} با ۸ بازیکن کامل شد!\n🥊 مرحله یک‌چهارم نهایی شروع می‌شود...")
         result=tournament_round(tid)
         if result and result[0]=="round":
-            await bot.send_message(t["chat_id"],"🏆 نتایج مرحله یک‌چهارم نهایی:\n\n"+"\n".join(f"⚔️ {display_name_by_id(a)} × {display_name_by_id(b)} → 🏆 {display_name_by_id(w)}" for a,b,w,l in result[3])+"\n\n➡️ مرحله بعدی: نیمه‌نهایی")
+            await bot.send_message(t["chat_id"],"🏆 نتایج مرحله یک‌چهارم نهایی:\n\n"+"\n".join(f"⚔️ {display_name_by_id(a)} ({pa} قدرت) × {display_name_by_id(b)} ({pb} قدرت) → 🏆 {display_name_by_id(w)}" for a,b,w,l,pa,pb,chance in result[3])+"\n\n➡️ مرحله بعدی: نیمه‌نهایی")
             result2=tournament_round(tid)
             if result2 and result2[0]=="round":
-                await bot.send_message(t["chat_id"],"🔥 نتایج نیمه‌نهایی:\n\n"+"\n".join(f"⚔️ {display_name_by_id(a)} × {display_name_by_id(b)} → 🏆 {display_name_by_id(w)}" for a,b,w,l in result2[3])+"\n\n➡️ فینال")
+                await bot.send_message(t["chat_id"],"🔥 نتایج نیمه‌نهایی:\n\n"+"\n".join(f"⚔️ {display_name_by_id(a)} ({pa} قدرت) × {display_name_by_id(b)} ({pb} قدرت) → 🏆 {display_name_by_id(w)}" for a,b,w,l,pa,pb,chance in result2[3])+"\n\n➡️ فینال")
                 result3=tournament_round(tid)
                 if result3 and result3[0]=="final": await bot.send_message(t["chat_id"],f"👑 قهرمان تورنمنت #{tid}: {display_name_by_id(result3[1])}\n💎 جایزه: {format_coins(result3[2])} آریور")
 
@@ -2731,16 +2939,15 @@ async def title_equip(query:CallbackQuery):
 async def user_leaderboard(query:CallbackQuery):
     rows=leaderboard(); text="🏆 رتبه‌بندی آریور\n\n"
     for i,(uid,username,balance,level,luck,exp) in enumerate(rows,1):
-        name='@'+username if username else f'کاربر {uid}'
+        name='@'+username if username else display_name_by_id(uid)
         text+=f"{i}. {name} — 💎 {format_coins(balance)} — ⭐ لول {level}\n"
     await query.message.edit_text(text or "هنوز داده‌ای نیست.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
 
 @dp.callback_query(F.data=="user:games")
 async def user_games(query:CallbackQuery):
     await query.message.edit_text("🎮 بازی‌های شرطی دو نفره آریور 💎\n\n"
-"⭕️ دوز: «دوز 100»\n✊ سنگ کاغذ قیچی: «سنگ کاغذ قیچی 100»\n🃏 جنگ کارت: «جنگ کارت 100»\n🎯 زوج یا فرد: «زوج یا فرد 100»\n🔢 حدس عدد: «حدس عدد 100»\n📈 بالاتر: «بالاتر 100»\n\n"
-"👥 بازی با دو بازیکن انجام می‌شود. سازنده مبلغ ورودی را می‌پردازد و با شرکت نفر دوم، مجموع ورودی‌ها جایزه برنده می‌شود.\n"
-"⏰ اگر تا ۶۰ ثانیه کسی شرکت نکند، مبلغ سازنده کامل برمی‌گردد.\n🤝 در بازی‌های مساوی، ورودی هر دو نفر برمی‌گردد.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
+"⭕️ دوز: «دوز 100»\n✊ سنگ کاغذ قیچی: «سنگ کاغذ قیچی 100»\n🃏 جنگ کارت: «جنگ کارت 100»\n🎯 زوج یا فرد: «زوج یا فرد 100»\n🔢 حدس عدد: «حدس عدد 100»\n📈 بالاتر: «بالاتر 100»\n🎲 تاس جنگ: «تاس جنگ 100»\n🪙 شیر یا خط: «شیر یا خط دو نفره 100»\n🃏 بلک‌جک: «بلک‌جک ساده 100»\n⚡ مسابقه سرعت: «مسابقه سرعت 100»\n🥊 مبارزه: «مبارزه 100»\n\n👥 همه بازی‌های بالا دو نفره‌اند. سازنده مبلغ ورودی را می‌پردازد و نفر دوم با همان مبلغ وارد می‌شود.\n"
+"⏰ اگر تا ۶۰ ثانیه کسی وارد نشود، مبلغ سازنده کامل برمی‌گردد.\n🤝 بازی مساوی = برگشت ورودی‌ها.\n🥊 در مبارزه، قدرت تجهیزات روی شانس برد اثر مستقیم دارد.",reply_markup=keyboard([[button("🔙 برگشت","user:menu")]])); await query.answer()
 
 @dp.callback_query(F.data=="user:history")
 async def user_history(query:CallbackQuery):
@@ -2755,7 +2962,7 @@ async def user_market(query:CallbackQuery):
     rows=active_market(); text="🛒 بازار آریور\n\n"
     kb=[]
     for lid,seller,amount,price,created in rows:
-        name='@'+((await bot.get_chat(seller)).username or '') if False else f"کاربر {seller}"
+        name=display_name_by_id(seller)
         text+=f"#{lid} — 💎 {format_coins(amount)} آریور با قیمت {format_coins(price)} آریور\n"
         kb.append([button(f"🛒 خرید #{lid}",f"market:buy:{lid}")])
     text += "\nفروش: «فروش مقدار قیمت»\nمثال: فروش 1000 1200"
@@ -2893,9 +3100,78 @@ async def callback_link(query: CallbackQuery):
     await query.answer()
     await bot.send_message(
         query.from_user.id,
-        f"🔗 لینک {slot} را ارسال کن.\n\nمثال: https://t.me/channel یا https://t.me/+InviteLink\n\nبعد از آن 🆔 Chat ID همان کانال/گروه را می‌پرسم تا بررسی عضویت دقیق انجام شود.",
+        f"🔗 لینک {slot} را ارسال کن.\n\nمثال: https://t.me/channel یا https://t.me/+InviteLink\n\nبعد از آن اطلاعات لازم را خودکار بررسی می‌کنم. 🤖",
     )
 
+
+# ================================================================
+# COMBAT / BLACK SHOP
+# ================================================================
+def black_shop_text():
+    lines=["🕶️ فروشگاه سیاه — تجهیزات مبارزه ⚔️\n"]
+    for i,(item,(cost,desc)) in enumerate(BLACK_SHOP_ITEMS.items(),1):
+        lines.append(f"{i}. {item} — 💎 {format_coins(cost)}\n   ⚔️ قدرت: +{COMBAT_POWER[item]} | {desc}")
+    return "\n".join(lines)
+
+def black_shop_keyboard():
+    return keyboard([[button(f"🛒 خرید {i}",f"blackshop:buy:{i}")] for i in range(1,len(BLACK_SHOP_ITEMS)+1)] + [[button("🎒 آیتم‌های من","user:inventory"),button("🔙 منو","user:menu")]])
+
+def combat_create(chat_id,creator_id,stake):
+    if stake<=0 or get_balance(creator_id)<stake:return None,"funds"
+    add_coins(creator_id,-stake); log_tx(creator_id,"combat_lock",-stake,"combat")
+    with db() as c:
+        cur=c.execute("INSERT INTO combat_battles(chat_id,creator_id,stake,status,created_at) VALUES(?,?,?,?,?)",(chat_id,creator_id,stake,"waiting",int(time.time()))); bid=cur.lastrowid; c.commit()
+    return bid,"ok"
+
+def combat_get(bid):
+    with db() as c:r=c.execute("SELECT id,chat_id,message_id,creator_id,opponent_id,stake,status,creator_power,opponent_power,winner_id,created_at FROM combat_battles WHERE id=?",(bid,)).fetchone()
+    if not r:return None
+    return {"id":r[0],"chat_id":r[1],"message_id":r[2],"creator_id":r[3],"opponent_id":r[4],"stake":r[5],"status":r[6],"creator_power":r[7],"opponent_power":r[8],"winner_id":r[9],"created_at":r[10]}
+
+def combat_join(bid,uid):
+    b=combat_get(bid)
+    if not b:return None,"missing"
+    if b["status"]!="waiting":return b,"closed"
+    if uid==b["creator_id"]:return b,"self"
+    if get_balance(uid)<b["stake"]:return b,"funds"
+    add_coins(uid,-b["stake"]); log_tx(uid,"combat_lock",-b["stake"],"combat")
+    with db() as c:
+        c.execute("UPDATE combat_battles SET opponent_id=?,status='active' WHERE id=? AND status='waiting'",(uid,bid)); c.commit()
+    return combat_get(bid),"ok"
+
+def resolve_combat(bid):
+    b=combat_get(bid)
+    if not b or b["status"]!="active":return None
+    cp,op=combat_power(b["creator_id"]),combat_power(b["opponent_id"])
+    bonus_c=10 if remove_item(b["creator_id"],"🍀 شانس ویژه",1) else 0
+    bonus_o=10 if remove_item(b["opponent_id"],"🍀 شانس ویژه",1) else 0
+    cchance=max(10,min(90,50+(cp-op)*2+bonus_c-bonus_o))
+    winner=b["creator_id"] if random.random()<cchance/100 else b["opponent_id"]
+    loser=b["opponent_id"] if winner==b["creator_id"] else b["creator_id"]
+    # 🛡️ Shield protects the loser once: both stakes are returned and the shield is consumed.
+    protected=remove_item(loser,"🛡️ سپر انرژی",1)
+    pot=b["stake"]*2
+    if protected:
+        add_coins(b["creator_id"],b["stake"]); add_coins(b["opponent_id"],b["stake"])
+        log_tx(b["creator_id"],"combat_shield_refund",b["stake"],"shield")
+        log_tx(b["opponent_id"],"combat_shield_refund",b["stake"],"shield")
+        record_game(b["creator_id"],"draw",b["stake"],"combat")
+        record_game(b["opponent_id"],"draw",b["stake"],"combat")
+        winner=None
+    else:
+        add_coins(winner,pot); log_tx(winner,"combat_win",pot,"combat")
+        record_game(winner,"win",pot,"combat"); record_game(loser,"loss",0,"combat")
+    with db() as c:c.execute("UPDATE combat_battles SET status='finished',creator_power=?,opponent_power=?,winner_id=? WHERE id=?",(cp,op,winner or 0,bid)); c.commit()
+    return {"battle":b,"creator_power":cp,"opponent_power":op,"creator_chance":cchance,"winner":winner,"loser":loser,"pot":pot,"bonus_creator":bonus_c,"bonus_opponent":bonus_o,"protected":protected}
+
+async def combat_expiry_task(bid):
+    await asyncio.sleep(WAGER_WAIT_SECONDS)
+    b=combat_get(bid)
+    if not b or b["status"]!="waiting":return
+    add_coins(b["creator_id"],b["stake"]); log_tx(b["creator_id"],"combat_refund",b["stake"],"combat")
+    with db() as c:c.execute("UPDATE combat_battles SET status='refunded' WHERE id=? AND status='waiting'",(bid,)); c.commit()
+    try:await bot.edit_message_text(f"⏰ زمان دعوت مبارزه تمام شد.\n💎 {format_coins(b['stake'])} آریور به سازنده برگشت.",chat_id=b["chat_id"],message_id=b["message_id"])
+    except Exception:pass
 
 # ================================================================
 # ORIGINAL BOT HANDLERS
@@ -3028,8 +3304,6 @@ async def handle_text(message: Message):
                             await message.answer(
                                 f"❌ ربات هنوز در لینک {slot} ادمین نیست. 🤖🛡️\n\n"
                                 f"ربات را وارد همان کانال/گروه کن و ادمینش کن، بعد دوباره لینک را ثبت کن.\n"
-                                f"🆔 Chat ID: <code>{chat_id}</code>",
-                                parse_mode="HTML",
                             )
                             return
                         set_setting("link" + slot, link_value)
@@ -3037,7 +3311,7 @@ async def handle_text(message: Message):
                         pending_link.pop(message.from_user.id, None)
                         title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat_id)
                         await message.answer(
-                            f"✅ لینک {slot} با موفقیت ذخیره شد. 🔗🤖\n\n📌 چت: {title}\n🆔 Chat ID: <code>{chat_id}</code>\n🛡️ وضعیت ربات: ادمین\n\n🎯 از این به بعد عضویت کاربران با Chat ID واقعی و Telegram getChatMember بررسی می‌شود. ✅",
+                            f"✅ لینک {slot} با موفقیت ذخیره شد. 🔗🤖\n\n📌 چت: {title}\n🛡️ وضعیت ربات: ادمین\n\n🎯 از این به بعد عضویت کاربران با Chat ID واقعی و Telegram getChatMember بررسی می‌شود. ✅",
                             parse_mode="HTML",
                         )
                     except Exception as exc:
@@ -3061,8 +3335,6 @@ async def handle_text(message: Message):
                     await message.answer(
                         f"❌ ربات در این چت ادمین نیست. 🤖🛡️\n\n"
                         f"اول ربات را داخل همان کانال/گروه ادمین کن و سپس پیام را دوباره فوروارد کن.\n"
-                        f"🆔 Chat ID: <code>{chat_id}</code>",
-                        parse_mode="HTML",
                     )
                     return
                 set_setting("link" + slot, link_value)
@@ -3070,7 +3342,7 @@ async def handle_text(message: Message):
                 pending_link.pop(message.from_user.id, None)
                 title = getattr(forwarded_chat, "title", None) or getattr(forwarded_chat, "username", None) or str(chat_id)
                 await message.answer(
-                    f"✅ لینک {slot} ذخیره شد. 🔗🤖\n\n📌 چت: {title}\n🆔 Chat ID: <code>{chat_id}</code>\n🛡️ وضعیت ربات: ادمین\n\n🎯 بررسی عضویت از این به بعد مستقیم با Chat ID واقعی انجام می‌شود. ✅",
+                    f"✅ لینک {slot} ذخیره شد. 🔗🤖\n\n📌 چت: {title}\n🛡️ وضعیت ربات: ادمین\n\n🎯 بررسی عضویت از این به بعد مستقیم با Chat ID واقعی انجام می‌شود. ✅",
                     parse_mode="HTML",
                 )
                 return
@@ -3113,7 +3385,7 @@ async def handle_text(message: Message):
                     await bot.send_message(target.id, f"⚠️ آرسین {format_coins(amount)} آریور از موجودی شما کسر کرد. 💎\n💰 موجودی جدید: {format_coins(new_balance)} آریور")
                 except Exception:
                     pass
-            target_label = f"@{target.username}" if target.username else f"کاربر {target.id}"
+            target_label = f"@{target.username}" if target.username else display_name_by_id(target.id)
             await message.reply(f"✅ {action_text} {target_label} انجام شد. 💎\n💰 موجودی جدید: {format_coins(new_balance)} آریور")
             return
 
@@ -3147,6 +3419,14 @@ async def handle_text(message: Message):
         rank,points=player_rank(message.from_user.id); await message.reply(f"🏆 رنک شما: {rank}\n⭐ امتیاز: {points}"); return
     if text in ("آیتم‌ها","آیتم ها","اینونتوری"):
         await message.reply(inventory_text(message.from_user.id)); return
+    if text in ("فروشگاه سیاه","فروشگاه مبارزه"):
+        await message.answer(black_shop_text(),reply_markup=black_shop_keyboard()); return
+    if text in ("قهرمان","قهرمانی","champion"):
+        ch=champion_record(message.from_user.id); await message.reply(f"👑 قهرمان\n\n🏆 قهرمانی‌ها: {ch['titles']}\n⚔️ بردهای قهرمانی: {ch['wins']}\n💪 بیشترین قدرت ثبت‌شده: {ch['best_power']}"); return
+    if text in ("فروشگاه سیاه","فروشگاه مبارزه"):
+        await message.answer(black_shop_text(),reply_markup=black_shop_keyboard()); return
+    if text in ("قهرمان","قهرمانی","champion"):
+        ch=champion_record(message.from_user.id); await message.reply(f"👑 قهرمان\n\n🏆 تعداد قهرمانی: {ch['titles']}\n⚔️ بردهای قهرمانی: {ch['wins']}\n💪 بیشترین قدرت ثبت‌شده: {ch['best_power']}"); return
     if text in ("فروشگاه","shop"):
         title_lines="\n".join(f"🏷️ عنوان {i}: {t} — {format_coins(c)} آریور" for i,(t,c) in enumerate(SHOP_ITEMS.items(),1))
         item_lines="\n".join(f"🎁 آیتم {i}: {t} — {format_coins(v[0])} آریور" for i,(t,v) in enumerate(SHOP_ITEMS_V2.items(),1))
@@ -3165,7 +3445,7 @@ async def handle_text(message: Message):
         if not 1<=idx<=len(titles): await message.reply("❌ شماره عنوان نامعتبر است."); return
         equip_title(message.from_user.id,titles[idx-1]); await message.reply(f"🏷️ عنوان {titles[idx-1]} فعال شد!"); return
     if text in ("رتبه بندی","رتبه‌بندی","لیدربورد"):
-        rows=leaderboard(); await message.reply("🏆 رتبه‌بندی:\n\n"+"\n".join(f"{i}. {'@'+u if u else 'کاربر '+str(uid)} — 💎 {format_coins(b)} — ⭐ {lv}" for i,(uid,u,b,lv,l,e) in enumerate(rows,1))); return
+        rows=leaderboard(); await message.reply("🏆 رتبه‌بندی:\n\n"+"\n".join(f"{i}. {'@'+u if u else display_name_by_id(uid)} — 💎 {format_coins(b)} — ⭐ {lv}" for i,(uid,u,b,lv,l,e) in enumerate(rows,1))); return
     if text in ("تاریخچه","تاریخچه آریور"):
         rows=recent_transactions(message.from_user.id); await message.reply("📜 آخرین تراکنش‌ها:\n\n"+"\n".join(f"• {k}: {('+' if a>0 else '')}{format_coins(a)} 💎 | {format_coins(b)}" for k,a,b,n,t in rows) or "📜 هنوز تراکنشی نیست."); return
     m=re.fullmatch(r"فروش\s+([0-9,]+)\s+([0-9,]+)",text)
@@ -3206,7 +3486,7 @@ async def handle_text(message: Message):
         if not target or target.id==message.from_user.id: await message.reply("❌ انتقال به خودت ممکن نیست. 🙅"); return
         if get_balance(message.from_user.id)<amount: await message.reply("❌ موجودی آریور کافی نیست. 💰"); return
         transfer_pending[message.from_user.id]=("confirm",amount,target.id,target.username or "")
-        label='@'+target.username if target.username else f'کاربر {target.id}'
+        label='@'+target.username if target.username else display_name_by_id(target.id)
         await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(amount)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
 
     if message.from_user.id in transfer_pending:
@@ -3220,7 +3500,7 @@ async def handle_text(message: Message):
             if not target or target.id==message.from_user.id: await message.reply("❌ انتقال به خودت ممکن نیست. 🙅"); return
             if get_balance(message.from_user.id)<state: await message.reply("❌ موجودی آریور کافی نیست. 💰"); transfer_pending.pop(message.from_user.id,None); return
             transfer_pending[message.from_user.id]=("confirm",state,target.id,target.username or "")
-            label='@'+target.username if target.username else f'کاربر {target.id}'
+            label='@'+target.username if target.username else display_name_by_id(target.id)
             await message.reply(f"⚠️ تأیید انتقال\n\n💸 مبلغ: {format_coins(state)} آریور\n👤 گیرنده: {label}\n\nتأیید می‌کنی؟",reply_markup=keyboard([[button("✅ تأیید انتقال",f"transfer:confirm:{message.from_user.id}"),button("❌ لغو",f"transfer:cancel:{message.from_user.id}")]])); return
 
     if text in ("استریک","streak"):
@@ -3236,17 +3516,30 @@ async def handle_text(message: Message):
         rows=leaderboard_points(); await message.reply("⭐ لیدربورد امتیاز\n\n"+"\n".join(f"{i}. {'@'+u if u else 'بازیکن'} — ⭐ {p}" for i,(uid,u,p,w,g,bs) in enumerate(rows,1))); return
     if text in ("آیتم‌ها","آیتم ها","اینونتوری"):
         await message.reply(inventory_text(message.from_user.id)); return
+    if text in ("فروشگاه سیاه","فروشگاه مبارزه"):
+        await message.answer(black_shop_text(),reply_markup=black_shop_keyboard()); return
+    if text in ("قهرمان","قهرمانی","champion"):
+        ch=champion_record(message.from_user.id); await message.reply(f"👑 قهرمان\n\n🏆 قهرمانی‌ها: {ch['titles']}\n⚔️ بردهای قهرمانی: {ch['wins']}\n💪 بیشترین قدرت ثبت‌شده: {ch['best_power']}"); return
     if text=="بازار آیتم":
         rows=active_item_market(); await message.reply("🛒 بازار آیتم\n\n"+"\n".join(f"#{lid} — {item} × {qty} — 💎 {format_coins(price)} — {'@'+get_user_record(seller)[1] if get_user_record(seller) and get_user_record(seller)[1] else 'بازیکن'}" for lid,seller,item,qty,price,created in rows) or "🛒 بازار آیتم خالی است."); return
-    m=re.fullmatch(r"فروش آیتم\\s+(.+?)\\s+(\\d+)\\s+([0-9,]+)",text)
+    m=re.fullmatch(r"فروش آیتم\s+(.+?)\s+(\d+)\s+([0-9,]+)",text)
     if m:
         item=m.group(1).strip(); qty=int(m.group(2)); price=int(m.group(3).replace(',',''))
         ok=create_item_listing(message.from_user.id,item,qty,price); await message.reply("✅ آیتم در بازار قرار گرفت. 🛒" if ok else "❌ آیتم، تعداد یا موجودی نامعتبر است. 🎒"); return
-    m=re.fullmatch(r"خرید آیتم\\s+(\\d+)",text)
+    m=re.fullmatch(r"خرید آیتم\s+(\d+)",text)
     if m:
         ok,why,price=buy_item_listing(message.from_user.id,int(m.group(1)))
         await message.reply("✅ آیتم خریداری شد. 🎁" if ok else ("❌ موجودی کافی نیست. 💎" if why=="funds" else "❌ آگهی پیدا نشد یا قابل خرید نیست. 🛒")); return
 
+    cm=re.fullmatch(r"مبارزه\s+([0-9][0-9,]*)",text)
+    if cm and message.chat.type in ("group","supergroup"):
+        stake=int(cm.group(1).replace(",",""))
+        if stake<=0: await message.reply("❌ مبلغ مبارزه باید بیشتر از صفر باشد. 💎"); return
+        bid,status=combat_create(message.chat.id,message.from_user.id,stake)
+        if status=="funds": await message.reply("❌ موجودی آریور برای ساخت مبارزه کافی نیست. 💎"); return
+        sent=await message.answer(f"🥊 مبارزه ساخته شد! ⚔️\n\n👤 مبارز اول: {display_name_by_id(message.from_user.id)}\n💎 ورودی هر نفر: {format_coins(stake)} آریور\n🏆 جایزه: {format_coins(stake*2)} آریور\n⏳ فرصت شرکت: {WAGER_WAIT_SECONDS} ثانیه\n\n👥 نفر دوم روی «شرکت کردن» بزند.",reply_markup=keyboard([[button("🥊 شرکت کردن",f"combat:join:{bid}")]]))
+        with db() as c:c.execute("UPDATE combat_battles SET message_id=? WHERE id=?",(sent.message_id,bid)); c.commit()
+        asyncio.create_task(combat_expiry_task(bid)); return
     tm=re.fullmatch(r"تورنمنت\s+([0-9][0-9,]*)",text)
     if tm and message.chat.type in ("group","supergroup"):
         stake=int(tm.group(1).replace(",","")); tid,status=tournament_create(message.chat.id,message.from_user.id,stake)
@@ -3383,7 +3676,7 @@ async def transfer_callback(query:CallbackQuery):
     amount,target_id,username=pending[1:]
     if get_balance(sender)<amount: transfer_pending.pop(sender,None); await query.message.edit_text("❌ موجودی آریور کافی نیست. 💰"); await query.answer(); return
     add_coins(sender,-amount); add_coins(target_id,amount); log_tx(sender,"transfer",-amount,f"to={target_id}"); log_tx(target_id,"transfer",amount,f"from={sender}"); bump_mission(sender,"transfer"); transfer_pending.pop(sender,None)
-    target_label='@'+username if username else f'کاربر {target_id}'
+    target_label='@'+username if username else display_name_by_id(target_id)
     await query.message.edit_text(f"✅ انتقال انجام شد! 💸\n\n💰 {format_coins(amount)} آریور به {target_label} منتقل شد.\n💳 موجودی شما: {format_coins(get_balance(sender))} آریور")
     try: await bot.send_message(target_id,f"🎁 {format_coins(amount)} آریور برای شما انتقال داده شد. 💸\n💰 موجودی: {format_coins(get_balance(target_id))} آریور")
     except Exception: pass
