@@ -38,7 +38,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 # - Keep the database file and back it up before replacing an existing deployment.
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = "8912622678:AAEdkrcaUIiVWf9ZlIwjMHJET8nTXZjoqwg"
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 ARSIN_OWNER_ID_RAW = os.getenv("ARSIN_OWNER_ID", "7311404671").strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
