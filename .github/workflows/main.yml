@@ -26,6 +26,7 @@ jobs:
       - name: Run bot for 15 minutes
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: |
           timeout --signal=INT --kill-after=10s 15m python arsin_auto_reply_fixed.py || code=$?
           if [ "${code:-0}" -eq 124 ] || [ "${code:-0}" -eq 130 ]; then
