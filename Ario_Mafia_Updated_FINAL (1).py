@@ -25,7 +25,7 @@ from aiogram.types import (
 # CONFIG
 # ================================================================
 # V20 — black market combat expansion + concurrency hardening
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TOKEN = "659564757:AAHJUliFimNsIHB-JBG0OJmloD8VlsFZkR4"
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required.")
 
